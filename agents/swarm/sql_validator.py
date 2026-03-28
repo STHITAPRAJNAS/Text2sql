@@ -23,6 +23,7 @@ from agents.tools.validation_tools import (
     check_performance_safety,
 )
 from agents.tools.schema_tools import get_database_schema
+from agents.tools.loop_tools import exit_validation_loop
 
 
 def create_sql_validator_agent() -> Agent:
@@ -54,5 +55,6 @@ def create_sql_validator_agent() -> Agent:
             check_sql_security,
             check_performance_safety,
             get_database_schema,
+            exit_validation_loop,   # Signals LoopAgent to stop when SQL passes all checks
         ],
     )

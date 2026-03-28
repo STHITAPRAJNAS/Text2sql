@@ -36,4 +36,5 @@ __all__ = [
     "check_performance_safety",
     "get_similar_examples",
     "add_example_to_store",
+    # "exit_validation_loop" - requires google-adk at runtime; import from loop_tools directly
 ]

@@ -18,7 +18,7 @@ import uuid
 from typing import Any
 
 import structlog
-from google.adk.runners import Runner
+from google.adk.runners import InMemoryRunner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 
@@ -31,22 +31,21 @@ logger = structlog.get_logger(__name__)
 _session_service = InMemorySessionService()
 
 # Runner singleton
-_runner: Runner | None = None
+_runner: InMemoryRunner | None = None
 
 APP_NAME = "text2sql_prism"
 
 
-def _get_runner() -> Runner:
-    """Get or create the ADK Runner singleton."""
+def _get_runner() -> InMemoryRunner:
+    """Get or create the ADK InMemoryRunner singleton."""
     global _runner
     if _runner is None:
         orchestrator = get_orchestrator()
-        _runner = Runner(
+        _runner = InMemoryRunner(
             agent=orchestrator,
             app_name=APP_NAME,
-            session_service=_session_service,
         )
-        logger.info("ADK Runner initialized", app=APP_NAME)
+        logger.info("ADK InMemoryRunner initialized", app=APP_NAME)
     return _runner
 
 
@@ -198,24 +197,6 @@ async def run_prism_query(
     try:
         runner = _get_runner()
 
-        # Get or create ADK session
-        session = await _session_service.get_session(
-            app_name=APP_NAME,
-            user_id=session_id,
-            session_id=session_id,
-        )
-        if session is None:
-            session = await _session_service.create_session(
-                app_name=APP_NAME,
-                user_id=session_id,
-                session_id=session_id,
-                state={
-                    "database_name": database_name,
-                    "max_rows": max_rows,
-                    "execute_query": execute_query,
-                },
-            )
-
         # Build the user message
         user_message = _build_user_message(
             query=query,
@@ -224,7 +205,8 @@ async def run_prism_query(
             execute_query=execute_query,
         )
 
-        # Invoke the PRISM orchestrator
+        # Invoke the PRISM orchestrator via ADK InMemoryRunner
+        # InMemoryRunner manages sessions internally; use user_id for continuity
         response_text = ""
         async for event in runner.run_async(
             user_id=session_id,
@@ -234,10 +216,10 @@ async def run_prism_query(
                 parts=[genai_types.Part(text=user_message)],
             ),
         ):
-            # Collect the final response
+            # Collect the final response from the last agent in the pipeline
             if event.is_final_response() and event.content and event.content.parts:
                 for part in event.content.parts:
-                    if part.text:
+                    if hasattr(part, "text") and part.text:
                         response_text += part.text
 
         pipeline_time_ms = (time.monotonic() - pipeline_start) * 1000

@@ -29,7 +29,7 @@ Architecture:
 """
 from __future__ import annotations
 
-from google.adk.agents import Agent, ParallelAgent, SequentialAgent, LoopAgent
+from google.adk.agents import Agent, LlmAgent, ParallelAgent, SequentialAgent, LoopAgent
 
 from config.prompts import PromptLibrary
 from config.settings import get_settings

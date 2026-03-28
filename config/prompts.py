@@ -236,7 +236,10 @@ Produce a ValidationResult with:
 - `corrected_sql`: if fixable, provide the corrected SQL
 - `fix_applied`: description of any automatic fixes
 
-If validation fails with unfixable errors, signal the orchestrator to re-generate."""
+## Loop Exit Protocol
+- If ALL four validation layers PASS (no blocking errors): call `exit_validation_loop` to stop the iteration loop and proceed to execution.
+- If validation FAILS with fixable errors: correct the SQL and return it (do NOT exit — let the optimizer run next).
+- If validation FAILS with unfixable errors: return the errors clearly (do NOT exit — trigger another generation cycle)."""
 
     # ------------------------------------------------------------------ #
     # Query Optimizer Agent                                                 #
