@@ -1,0 +1,22 @@
+{
+  "revenue": "SUM of total_amount from completed orders",
+  "GMV": "Gross Merchandise Value = SUM(quantity * unit_price) before discounts",
+  "net_revenue": "SUM(quantity * unit_price * (1 - discount)) from completed orders",
+  "active_customers": "Customers who placed at least one order in the last 30 days",
+  "churn": "Customers who were active 60-90 days ago but not in the last 30 days",
+  "AOV": "Average Order Value = total_revenue / order_count",
+  "LTV": "Lifetime Value = total_amount spent by a customer across all orders",
+  "MoM": "Month-over-month: comparing current month vs previous month",
+  "YoY": "Year-over-year: comparing current period vs same period last year",
+  "YTD": "Year-to-date: from January 1st to today",
+  "conversion_rate": "Percentage of customers who placed an order",
+  "repeat_customers": "Customers with more than 1 completed order",
+  "new_customers": "Customers whose created_at is within the specified period",
+  "enterprise_segment": "Customers with segment = 'Enterprise'",
+  "SMB_segment": "Customers with segment = 'SMB'",
+  "pending_orders": "Orders with status = 'pending'",
+  "completed_orders": "Orders with status = 'completed'",
+  "top_N": "Use ORDER BY ... DESC LIMIT N pattern",
+  "discount_rate": "Average value of the discount column in order_items",
+  "product_mix": "Distribution of revenue across product categories"
+}

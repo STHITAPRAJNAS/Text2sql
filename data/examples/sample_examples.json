@@ -1,0 +1,62 @@
+[
+  {
+    "question": "How many customers do we have?",
+    "sql": "SELECT COUNT(*) AS total_customers FROM customers",
+    "database": "default",
+    "tags": ["count", "customers"]
+  },
+  {
+    "question": "What are the top 10 customers by total order amount?",
+    "sql": "SELECT c.customer_name, SUM(o.total_amount) AS total_revenue\nFROM customers c\nJOIN orders o ON c.customer_id = o.customer_id\nGROUP BY c.customer_id, c.customer_name\nORDER BY total_revenue DESC\nLIMIT 10",
+    "database": "default",
+    "tags": ["aggregation", "join", "top-n", "revenue"]
+  },
+  {
+    "question": "What is the monthly revenue for this year?",
+    "sql": "SELECT\n    strftime('%Y-%m', order_date) AS month,\n    SUM(total_amount) AS monthly_revenue,\n    COUNT(order_id) AS order_count\nFROM orders\nWHERE order_date >= date('now', 'start of year')\nGROUP BY strftime('%Y-%m', order_date)\nORDER BY month",
+    "database": "default",
+    "tags": ["time-series", "revenue", "monthly"]
+  },
+  {
+    "question": "Which product categories have the highest sales?",
+    "sql": "SELECT\n    p.category,\n    SUM(oi.quantity * oi.unit_price * (1 - oi.discount)) AS total_sales,\n    COUNT(DISTINCT oi.order_id) AS order_count\nFROM order_items oi\nJOIN products p ON oi.product_id = p.product_id\nGROUP BY p.category\nORDER BY total_sales DESC",
+    "database": "default",
+    "tags": ["aggregation", "join", "category"]
+  },
+  {
+    "question": "Show me pending orders with customer details",
+    "sql": "SELECT\n    o.order_id,\n    c.customer_name,\n    c.email,\n    o.order_date,\n    o.total_amount\nFROM orders o\nJOIN customers c ON o.customer_id = c.customer_id\nWHERE o.status = 'pending'\nORDER BY o.order_date DESC\nLIMIT 100",
+    "database": "default",
+    "tags": ["filter", "join", "status"]
+  },
+  {
+    "question": "What is the average order value by customer segment?",
+    "sql": "SELECT\n    c.segment,\n    AVG(o.total_amount) AS avg_order_value,\n    COUNT(o.order_id) AS total_orders,\n    SUM(o.total_amount) AS total_revenue\nFROM customers c\nJOIN orders o ON c.customer_id = o.customer_id\nWHERE o.status = 'completed'\nGROUP BY c.segment\nORDER BY avg_order_value DESC",
+    "database": "default",
+    "tags": ["aggregation", "join", "segment", "average"]
+  },
+  {
+    "question": "Which customers have not placed any orders?",
+    "sql": "SELECT\n    c.customer_id,\n    c.customer_name,\n    c.email,\n    c.created_at\nFROM customers c\nLEFT JOIN orders o ON c.customer_id = o.customer_id\nWHERE o.order_id IS NULL\nORDER BY c.created_at DESC",
+    "database": "default",
+    "tags": ["left-join", "null-check", "anti-join"]
+  },
+  {
+    "question": "What percentage of orders are completed vs pending?",
+    "sql": "SELECT\n    status,\n    COUNT(*) AS order_count,\n    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS percentage\nFROM orders\nGROUP BY status\nORDER BY order_count DESC",
+    "database": "default",
+    "tags": ["window-function", "percentage", "status"]
+  },
+  {
+    "question": "Find customers who placed orders in both January and February 2024",
+    "sql": "SELECT DISTINCT c.customer_name, c.email\nFROM customers c\nWHERE c.customer_id IN (\n    SELECT customer_id FROM orders\n    WHERE strftime('%Y-%m', order_date) = '2024-01'\n)\nAND c.customer_id IN (\n    SELECT customer_id FROM orders\n    WHERE strftime('%Y-%m', order_date) = '2024-02'\n)",
+    "database": "default",
+    "tags": ["subquery", "date-filter", "intersection"]
+  },
+  {
+    "question": "Show top 5 products by revenue with their category",
+    "sql": "SELECT\n    p.product_name,\n    p.category,\n    SUM(oi.quantity * oi.unit_price * (1 - oi.discount)) AS total_revenue,\n    SUM(oi.quantity) AS units_sold\nFROM products p\nJOIN order_items oi ON p.product_id = oi.product_id\nJOIN orders o ON oi.order_id = o.order_id\nWHERE o.status = 'completed'\nGROUP BY p.product_id, p.product_name, p.category\nORDER BY total_revenue DESC\nLIMIT 5",
+    "database": "default",
+    "tags": ["top-n", "join", "aggregation", "product"]
+  }
+]
