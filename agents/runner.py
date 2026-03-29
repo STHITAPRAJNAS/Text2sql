@@ -183,8 +183,24 @@ async def _run_pipeline_once(
     user_id: str,
 ) -> str:
     """Run one pass of the PRISM pipeline. Returns raw response text."""
+    text, _, _ = await _run_pipeline_with_tokens(message, session_id, user_id)
+    return text
+
+
+async def _run_pipeline_with_tokens(
+    message: str,
+    session_id: str,
+    user_id: str,
+) -> tuple[str, int, int]:
+    """
+    Run one pass of the PRISM pipeline.
+    Returns (response_text, total_input_tokens, total_output_tokens).
+    Token counts are summed across all agent steps in the pipeline.
+    """
     runner = _get_runner()
     text = ""
+    token_input = 0
+    token_output = 0
     async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
@@ -193,11 +209,35 @@ async def _run_pipeline_once(
             parts=[genai_types.Part(text=message)],
         ),
     ):
+        # Extract token usage from ADK events (available on LLM response events)
+        usage = getattr(event, "usage_metadata", None)
+        if usage:
+            token_input += getattr(usage, "prompt_token_count", 0) or 0
+            token_output += getattr(usage, "candidates_token_count", 0) or 0
+
         if event.is_final_response() and event.content and event.content.parts:
             for part in event.content.parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
-    return text
+    return text, token_input, token_output
+
+
+def _check_allowlist(query: str, database_name: str) -> str | None:
+    """Return an error message if the query violates the allowlist, else None."""
+    try:
+        settings = get_settings()
+        if not settings.allowlist.enabled:
+            return None
+        import re as _re
+        allowed_dbs = settings.allowlist.allowed_databases
+        if allowed_dbs and database_name not in allowed_dbs:
+            return f"Database '{database_name}' is not in the allowed list: {allowed_dbs}"
+        for pattern in settings.allowlist.blocked_sql_patterns:
+            if _re.search(pattern, query, _re.IGNORECASE):
+                return f"Query matches blocked pattern: {pattern}"
+    except Exception:
+        pass
+    return None
 
 
 async def run_prism_query(
@@ -207,17 +247,20 @@ async def run_prism_query(
     max_rows: int = 100,
     execute_query: bool = True,
     user_id: str | None = None,
+    correlation_id: str | None = None,
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     """
     Run a natural language query through the full PRISM pipeline.
 
     Flow:
-      1. Semantic cache check (L1 Redis + L2 ChromaDB) — instant return on hit
-      2. Run PRISM pipeline once
-      3. On SQL execution error: auto-retry up to max_execution_retries times
+      1. Allowlist/blocklist check (< 1ms)
+      2. Semantic cache check (L1 Redis + L2 ChromaDB) — instant return on hit
+      3. Run PRISM pipeline once
+      4. On SQL execution error: auto-retry up to max_execution_retries times
          with error context fed back to the generator
-      4. Fire-and-forget audit log write
-      5. Dead letter queue write on persistent failure
+      5. Fire-and-forget audit log write with correlation_id + token_usage
+      6. Dead letter queue write on persistent failure
 
     Args:
         query: Natural language question
@@ -226,6 +269,8 @@ async def run_prism_query(
         max_rows: Maximum result rows
         execute_query: Whether to execute the generated SQL
         user_id: Caller user ID for history tracking
+        correlation_id: X-Request-ID for end-to-end tracing
+        tenant_id: Tenant scope for glossary/few-shot isolation
 
     Returns:
         Structured result dict
@@ -233,9 +278,26 @@ async def run_prism_query(
     settings = get_settings()
     session_id = session_id or str(uuid.uuid4())
     user_id = user_id or session_id
+    correlation_id = correlation_id or str(uuid.uuid4())
     pipeline_start = time.monotonic()
 
-    logger.info("PRISM query", sid=session_id, preview=query[:80], db=database_name)
+    logger.info(
+        "PRISM query", sid=session_id, cid=correlation_id,
+        preview=query[:80], db=database_name, tenant=tenant_id,
+    )
+
+    # ------------------------------------------------------------------ #
+    # 0. Allowlist/blocklist check                                         #
+    # ------------------------------------------------------------------ #
+    block_reason = _check_allowlist(query, database_name)
+    if block_reason:
+        logger.warning("Query blocked by allowlist", reason=block_reason, cid=correlation_id)
+        return {
+            **_error_result(session_id, query, block_reason, pipeline_start),
+            "correlation_id": correlation_id,
+            "error": block_reason,
+            "suggestions": ["Contact your administrator to whitelist this database or query type."],
+        }
 
     # ------------------------------------------------------------------ #
     # 1. Semantic cache check                                              #
@@ -250,8 +312,10 @@ async def run_prism_query(
                 cached.update({
                     "session_id": session_id, "pipeline_time_ms": round(elapsed, 2),
                     "cache_hit": True, "cache_source": cache_source,
+                    "correlation_id": correlation_id,
                 })
-                _fire_audit(cached, session_id, user_id, query, database_name)
+                _fire_audit(cached, session_id, user_id, query, database_name,
+                            correlation_id=correlation_id)
                 logger.info("Cache hit", source=cache_source, ms=round(elapsed, 2))
                 return cached
         except Exception as exc:
@@ -260,7 +324,7 @@ async def run_prism_query(
     # ------------------------------------------------------------------ #
     # 2. Build user message                                                #
     # ------------------------------------------------------------------ #
-    base_message = _build_message(query, database_name, max_rows, execute_query)
+    base_message = _build_message(query, database_name, max_rows, execute_query, tenant_id)
 
     # ------------------------------------------------------------------ #
     # 3. Run pipeline with auto-retry on execution error                   #
@@ -268,6 +332,8 @@ async def run_prism_query(
     max_retries = getattr(settings.deep_think, "max_execution_retries", 2)
     result: dict[str, Any] = {}
     last_error = None
+    total_token_input = 0
+    total_token_output = 0
 
     for attempt in range(max_retries + 1):
         try:
@@ -284,13 +350,20 @@ async def run_prism_query(
                 logger.info("Auto-retry", attempt=attempt, error=last_error[:80])
 
             with trace_phase("total", {"query": query[:80], "database": database_name, "attempt": attempt}):
-                response_text = await _run_pipeline_once(message, session_id, user_id)
+                response_text, tok_in, tok_out = await _run_pipeline_with_tokens(
+                    message, session_id, user_id
+                )
+                total_token_input += tok_in
+                total_token_output += tok_out
 
             result = _parse_response(response_text)
             result.update({
                 "pipeline_time_ms": round((time.monotonic() - pipeline_start) * 1000, 2),
                 "session_id": session_id,
                 "cache_hit": False,
+                "correlation_id": correlation_id,
+                "token_input": total_token_input,
+                "token_output": total_token_output,
                 "pipeline_stages": [
                     "schema_discovery", "metadata_enrichment", "deep_think_analysis",
                     "schema_linking", "sql_generation", "sql_validation",
@@ -339,7 +412,8 @@ async def run_prism_query(
             )
 
     # Fire-and-forget audit write
-    _fire_audit(result, session_id, user_id, query, database_name)
+    _fire_audit(result, session_id, user_id, query, database_name,
+                correlation_id=correlation_id)
 
     logger.info(
         "PRISM complete", sid=session_id,
@@ -350,18 +424,32 @@ async def run_prism_query(
     return result
 
 
-def _fire_audit(result: dict, session_id: str, user_id: str, query: str, database_name: str) -> None:
+def _fire_audit(
+    result: dict,
+    session_id: str,
+    user_id: str,
+    query: str,
+    database_name: str,
+    correlation_id: str | None = None,
+) -> None:
     """Fire-and-forget audit log write."""
     try:
         from core.audit_log import log_query
-        log_query({
-            **result,
-            "nl_query": query,
-            "database_name": database_name,
-            "pii_detected": bool(
-                result.get("pii_report") and result["pii_report"].get("pii_detected")
-            ),
-        }, session_id=session_id, user_id=user_id)
+        log_query(
+            {
+                **result,
+                "nl_query": query,
+                "database_name": database_name,
+                "pii_detected": bool(
+                    result.get("pii_report") and result["pii_report"].get("pii_detected")
+                ),
+            },
+            session_id=session_id,
+            user_id=user_id,
+            correlation_id=correlation_id or result.get("correlation_id"),
+            token_input=result.get("token_input"),
+            token_output=result.get("token_output"),
+        )
     except Exception:
         pass
 
@@ -501,12 +589,20 @@ async def stream_prism_query(
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-def _build_message(query: str, database_name: str, max_rows: int, execute_query: bool) -> str:
+def _build_message(
+    query: str,
+    database_name: str,
+    max_rows: int,
+    execute_query: bool,
+    tenant_id: str = "default",
+) -> str:
     settings = get_settings()
     db_url = settings.database.database_url
     dialect = db_url.split("+")[0].split(":")[0] if ":" in db_url else "sql"
     if settings.databricks.is_configured:
         dialect = "spark_sql (Databricks)"
+
+    tenant_note = f"\n- Tenant: {tenant_id}" if tenant_id != "default" else ""
 
     return f"""## Text2SQL PRISM Request
 
@@ -518,11 +614,11 @@ def _build_message(query: str, database_name: str, max_rows: int, execute_query:
 - Max Rows: {max_rows}
 - Execute Query: {execute_query}
 - Deep Think Iterations: {settings.deep_think.deep_think_max_iterations}
-- Confidence Threshold: {settings.deep_think.deep_think_confidence_threshold}
+- Confidence Threshold: {settings.deep_think.deep_think_confidence_threshold}{tenant_note}
 
 **Instructions:**
 1. Phase P: Discover schema (vector search first), check for schema changes
-2. Phase R: Resolve business terms via glossary FIRST, then Deep Think analysis.
+2. Phase R: Resolve business terms via glossary FIRST (tenant={tenant_id}), then Deep Think analysis.
    Request clarification if confidence < {settings.deep_think.deep_think_confidence_threshold}
 3. Phase I: Generate SQL (check semantic memory for similar past queries first)
 4. Phase S: Validate complexity budget, syntax, schema, security, performance.

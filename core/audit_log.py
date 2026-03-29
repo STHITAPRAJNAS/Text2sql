@@ -104,6 +104,19 @@ async def _init_tables() -> None:
                     );
                 """)
                 await db.commit()
+                # Migrate: add new columns if they don't exist yet
+                for col_def in [
+                    "correlation_id TEXT",
+                    "token_input INTEGER",
+                    "token_output INTEGER",
+                ]:
+                    try:
+                        await db.execute(
+                            f"ALTER TABLE query_audit_log ADD COLUMN {col_def}"
+                        )
+                        await db.commit()
+                    except Exception:
+                        pass  # Column already exists
             _initialized = True
             logger.info("Audit log tables initialized")
         except Exception as exc:
@@ -137,8 +150,8 @@ async def _write_audit(entry: dict[str, Any]) -> None:
                 (query_id, user_id, session_id, nl_query, generated_sql, optimized_sql,
                  database_name, success, confidence, execution_time_ms, pipeline_time_ms,
                  row_count, cache_hit, cache_source, pii_detected, cost_warning, error,
-                 needs_clarification, created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 needs_clarification, created_at, correlation_id, token_input, token_output)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 entry["query_id"], entry.get("user_id", ""), entry.get("session_id", ""),
                 entry.get("nl_query", ""), entry.get("generated_sql", ""), entry.get("optimized_sql", ""),
@@ -149,6 +162,7 @@ async def _write_audit(entry: dict[str, Any]) -> None:
                 int(entry.get("pii_detected", False)), entry.get("cost_warning"),
                 entry.get("error"), int(entry.get("needs_clarification", False)),
                 entry.get("created_at", time.time()),
+                entry.get("correlation_id"), entry.get("token_input"), entry.get("token_output"),
             ))
             await db.commit()
     except Exception as exc:
@@ -205,13 +219,28 @@ async def _write_calibration(entry: dict[str, Any]) -> None:
 # Public API — all writes are fire-and-forget                          #
 # ------------------------------------------------------------------ #
 
-def log_query(result: dict[str, Any], session_id: str = "", user_id: str = "") -> str:
+def log_query(
+    result: dict[str, Any],
+    session_id: str = "",
+    user_id: str = "",
+    correlation_id: str | None = None,
+    token_input: int | None = None,
+    token_output: int | None = None,
+) -> str:
     """
     Record a query in the audit log. Non-blocking — returns immediately.
     Returns the generated query_id.
     """
     query_id = result.get("query_id") or str(uuid.uuid4())
-    entry = {**result, "query_id": query_id, "session_id": session_id, "user_id": user_id}
+    entry = {
+        **result,
+        "query_id": query_id,
+        "session_id": session_id,
+        "user_id": user_id,
+        "correlation_id": correlation_id or result.get("correlation_id"),
+        "token_input": token_input or result.get("token_input"),
+        "token_output": token_output or result.get("token_output"),
+    }
     _fire(_write_audit(entry))
 
     # Also record calibration data
@@ -220,6 +249,15 @@ def log_query(result: dict[str, Any], session_id: str = "", user_id: str = "") -
         "predicted_conf": result.get("confidence", 0.0),
         "was_successful": result.get("success", False),
     }))
+
+    # Track performance regression (fire-and-forget)
+    pipeline_ms = result.get("pipeline_time_ms", 0.0)
+    if pipeline_ms and result.get("nl_query"):
+        try:
+            from core.performance_tracker import track_and_alert
+            track_and_alert(result["nl_query"], pipeline_ms)
+        except Exception:
+            pass
 
     return query_id
 

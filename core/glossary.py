@@ -35,10 +35,15 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-# In-memory cache: {term_lower: GlossaryEntry}
+# In-memory cache: {(term_lower, tenant_id): GlossaryEntry}
+# Also supports bare term_lower key for the "default" tenant (backwards compat)
 _cache: dict[str, dict[str, Any]] = {}
 _db_initialized = False
 _db_lock = asyncio.Lock()
+
+
+def _cache_key(term: str, tenant_id: str = "default") -> str:
+    return f"{tenant_id}::{term.lower().strip()}"
 
 
 # ------------------------------------------------------------------ #
@@ -69,18 +74,55 @@ async def _init_db() -> None:
             import pathlib
             pathlib.Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             async with aiosqlite.connect(db_path) as db:
-                await db.execute("""
-                    CREATE TABLE IF NOT EXISTS glossary_terms (
-                        term        TEXT PRIMARY KEY COLLATE NOCASE,
-                        table_name  TEXT,
-                        column_name TEXT,
-                        filter_sql  TEXT,
-                        description TEXT,
-                        example_sql TEXT,
-                        created_at  REAL,
-                        updated_at  REAL
-                    )
-                """)
+                # Check if table exists with old schema (single PK on term)
+                async with db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='glossary_terms'"
+                ) as cur:
+                    exists = await cur.fetchone()
+
+                if exists:
+                    # Check if tenant_id column already present
+                    async with db.execute("PRAGMA table_info(glossary_terms)") as cur:
+                        cols = {row[1] for row in await cur.fetchall()}
+
+                    if "tenant_id" not in cols:
+                        # Migrate: recreate table with composite PK
+                        await db.executescript("""
+                            CREATE TABLE IF NOT EXISTS glossary_terms_new (
+                                term        TEXT NOT NULL COLLATE NOCASE,
+                                tenant_id   TEXT NOT NULL DEFAULT 'default',
+                                table_name  TEXT,
+                                column_name TEXT,
+                                filter_sql  TEXT,
+                                description TEXT,
+                                example_sql TEXT,
+                                created_at  REAL,
+                                updated_at  REAL,
+                                PRIMARY KEY (term, tenant_id)
+                            );
+                            INSERT OR IGNORE INTO glossary_terms_new
+                                SELECT term, 'default', table_name, column_name,
+                                       filter_sql, description, example_sql,
+                                       created_at, updated_at
+                                FROM glossary_terms;
+                            DROP TABLE glossary_terms;
+                            ALTER TABLE glossary_terms_new RENAME TO glossary_terms;
+                        """)
+                else:
+                    await db.execute("""
+                        CREATE TABLE IF NOT EXISTS glossary_terms (
+                            term        TEXT NOT NULL COLLATE NOCASE,
+                            tenant_id   TEXT NOT NULL DEFAULT 'default',
+                            table_name  TEXT,
+                            column_name TEXT,
+                            filter_sql  TEXT,
+                            description TEXT,
+                            example_sql TEXT,
+                            created_at  REAL,
+                            updated_at  REAL,
+                            PRIMARY KEY (term, tenant_id)
+                        )
+                    """)
                 await db.commit()
             _db_initialized = True
             logger.info("Glossary DB initialized")
@@ -98,7 +140,11 @@ async def _load_cache() -> None:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM glossary_terms") as cur:
                 rows = await cur.fetchall()
-        _cache = {row["term"].lower(): dict(row) for row in rows}
+        new_cache = {}
+        for row in rows:
+            d = dict(row)
+            new_cache[_cache_key(d["term"], d.get("tenant_id", "default"))] = d
+        _cache = new_cache
         logger.debug("Glossary cache loaded", entries=len(_cache))
     except Exception as exc:
         logger.warning("Glossary cache load failed", error=str(exc))
@@ -108,15 +154,22 @@ async def _load_cache() -> None:
 # Public API                                                           #
 # ------------------------------------------------------------------ #
 
-async def lookup(term: str) -> dict[str, Any] | None:
+async def lookup(
+    term: str, tenant_id: str = "default"
+) -> dict[str, Any] | None:
     """
     Look up a business term. Returns the glossary entry or None.
+    Checks tenant-scoped entry first, then falls back to 'default' tenant.
     Fast O(1) from in-memory cache after first load.
     """
     await _init_db()
     if not _cache:
         await _load_cache()
-    return _cache.get(term.lower().strip())
+    # Try tenant-specific first, then default tenant
+    result = _cache.get(_cache_key(term, tenant_id))
+    if result is None and tenant_id != "default":
+        result = _cache.get(_cache_key(term, "default"))
+    return result
 
 
 async def upsert(
@@ -126,18 +179,21 @@ async def upsert(
     filter_sql: str = "",
     description: str = "",
     example_sql: str = "",
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     """Insert or update a glossary term."""
     await _init_db()
     now = time.time()
+    ck = _cache_key(term, tenant_id)
     entry = {
         "term": term,
+        "tenant_id": tenant_id,
         "table_name": table_name,
         "column_name": column_name,
         "filter_sql": filter_sql,
         "description": description,
         "example_sql": example_sql,
-        "created_at": _cache.get(term.lower(), {}).get("created_at", now),
+        "created_at": _cache.get(ck, {}).get("created_at", now),
         "updated_at": now,
     }
     try:
@@ -146,9 +202,10 @@ async def upsert(
         async with aiosqlite.connect(db_path) as db:
             await db.execute("""
                 INSERT INTO glossary_terms
-                    (term, table_name, column_name, filter_sql, description, example_sql, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(term) DO UPDATE SET
+                    (term, tenant_id, table_name, column_name, filter_sql,
+                     description, example_sql, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(term, tenant_id) DO UPDATE SET
                     table_name  = excluded.table_name,
                     column_name = excluded.column_name,
                     filter_sql  = excluded.filter_sql,
@@ -156,67 +213,79 @@ async def upsert(
                     example_sql = excluded.example_sql,
                     updated_at  = excluded.updated_at
             """, (
-                entry["term"], entry["table_name"], entry["column_name"],
+                entry["term"], tenant_id, entry["table_name"], entry["column_name"],
                 entry["filter_sql"], entry["description"], entry["example_sql"],
                 entry["created_at"], entry["updated_at"],
             ))
             await db.commit()
-        _cache[term.lower()] = entry
-        logger.info("Glossary term upserted", term=term)
+        _cache[ck] = entry
+        logger.info("Glossary term upserted", term=term, tenant=tenant_id)
         return {"status": "ok", "term": term}
     except Exception as exc:
         logger.warning("Glossary upsert failed", term=term, error=str(exc))
         return {"status": "error", "error": str(exc)}
 
 
-async def delete(term: str) -> bool:
+async def delete(term: str, tenant_id: str = "default") -> bool:
     """Delete a glossary term. Returns True if deleted."""
     await _init_db()
     try:
         import aiosqlite
         db_path = await _get_db_path()
         async with aiosqlite.connect(db_path) as db:
-            await db.execute("DELETE FROM glossary_terms WHERE term = ? COLLATE NOCASE", (term,))
+            cursor = await db.execute(
+                "DELETE FROM glossary_terms WHERE term = ? COLLATE NOCASE AND tenant_id = ?",
+                (term, tenant_id),
+            )
             await db.commit()
-        _cache.pop(term.lower(), None)
-        return True
+            deleted = cursor.rowcount > 0
+        _cache.pop(_cache_key(term, tenant_id), None)
+        return deleted
     except Exception:
         return False
 
 
-async def list_all(limit: int = 200) -> list[dict[str, Any]]:
-    """Return all glossary terms."""
+async def list_all(limit: int = 200, tenant_id: str = "default") -> list[dict[str, Any]]:
+    """Return all glossary terms for a tenant."""
     await _init_db()
     if not _cache:
         await _load_cache()
-    items = list(_cache.values())
+    items = [
+        v for v in _cache.values()
+        if v.get("tenant_id", "default") in (tenant_id, "default")
+    ]
     items.sort(key=lambda x: x.get("term", ""))
     return items[:limit]
 
 
-async def search(query: str, limit: int = 10) -> list[dict[str, Any]]:
-    """Simple keyword search over terms and descriptions."""
+async def search(query: str, limit: int = 10, tenant_id: str = "default") -> list[dict[str, Any]]:
+    """Simple keyword search over terms and descriptions, scoped by tenant."""
     await _init_db()
     if not _cache:
         await _load_cache()
     q = query.lower()
     results = [
         entry for entry in _cache.values()
-        if q in entry.get("term", "").lower()
-        or q in entry.get("description", "").lower()
+        if entry.get("tenant_id", "default") in (tenant_id, "default")
+        and (q in entry.get("term", "").lower() or q in entry.get("description", "").lower())
     ]
     return results[:limit]
 
 
 # Sync wrapper for agent tools (tools can't be async in some ADK versions)
-def lookup_sync(term: str) -> dict[str, Any] | None:
+def lookup_sync(term: str, tenant_id: str = "default") -> dict[str, Any] | None:
+    # Fast path: in-memory cache
+    cached = _cache.get(_cache_key(term, tenant_id))
+    if cached is None and tenant_id != "default":
+        cached = _cache.get(_cache_key(term, "default"))
+    if cached is not None:
+        return cached
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # Schedule in thread pool
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(asyncio.run, lookup(term)).result(timeout=3)
-        return loop.run_until_complete(lookup(term))
+                return pool.submit(asyncio.run, lookup(term, tenant_id)).result(timeout=3)
+        return loop.run_until_complete(lookup(term, tenant_id))
     except Exception:
-        return _cache.get(term.lower().strip())
+        return None

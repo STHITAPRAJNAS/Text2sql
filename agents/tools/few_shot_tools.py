@@ -54,6 +54,7 @@ def get_similar_examples(
     query: str,
     top_k: int = 5,
     database_name: str | None = None,
+    tenant_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Retrieve similar text-to-SQL examples from the few-shot store.
@@ -90,7 +91,13 @@ def get_similar_examples(
         global _embedder
         query_embedding = _embedder.encode(query).tolist()
 
-        where_filter = {"database_name": database_name} if database_name else None
+        where_filter: dict | None = None
+        if database_name and tenant_id:
+            where_filter = {"$and": [{"database_name": database_name}, {"tenant_id": tenant_id}]}
+        elif database_name:
+            where_filter = {"database_name": database_name}
+        elif tenant_id:
+            where_filter = {"tenant_id": tenant_id}
 
         results = collection.query(
             query_embeddings=[query_embedding],
@@ -137,6 +144,7 @@ def add_example_to_store(
     database_name: str = "default",
     tags: list[str] | None = None,
     feedback_score: float = 1.0,
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     """
     Add a new text-to-SQL example to the few-shot example store.
@@ -193,6 +201,7 @@ def add_example_to_store(
                 "database_name": database_name,
                 "tags": json.dumps(tags),
                 "feedback_score": str(feedback_score),
+                "tenant_id": tenant_id,
             }],
         )
 

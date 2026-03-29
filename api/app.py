@@ -43,6 +43,7 @@ from api.models import (
     DeadLetterResponse,
     ExampleRequest,
     ExampleResponse,
+    ExportFormat,
     FeedbackRequest,
     FeedbackResponse,
     GlossaryTerm,
@@ -52,9 +53,14 @@ from api.models import (
     HistoryResponse,
     IndexRequest,
     IndexResponse,
+    PerformanceBaseline,
     QueryRequest,
     QueryResponse,
+    RateLimitStats,
     ResolveDeadLetterRequest,
+    SavedQuery,
+    SavedQueryRequest,
+    SavedQueryRunRequest,
     SchemaIndexListResponse,
     SchemaResponse,
 )
@@ -140,13 +146,35 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
     @app.middleware("http")
-    async def add_timing_header(request: Request, call_next):
+    async def add_timing_and_correlation(request: Request, call_next):
+        # Propagate or generate correlation ID
+        correlation_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         start = time.monotonic()
         response = await call_next(request)
-        response.headers["X-Process-Time-Ms"] = str(
-            round((time.monotonic() - start) * 1000, 2)
-        )
+        elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+        response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+        response.headers["X-Request-ID"] = correlation_id
         return response
+
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        # Only apply to API endpoints
+        if not request.url.path.startswith("/api/v1/"):
+            return await call_next(request)
+        try:
+            from core.rate_limiter import check_rate_limit
+            api_key_val = request.headers.get(settings.api.api_key_header)
+            user_id_val = request.headers.get("X-User-ID")
+            allowed, retry_after = check_rate_limit(user_id=user_id_val, api_key=api_key_val)
+            if not allowed:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded", "retry_after_seconds": retry_after},
+                    headers={"Retry-After": str(retry_after)},
+                )
+        except Exception:
+            pass
+        return await call_next(request)
 
     # ------------------------------------------------------------------ #
     # Optional API key security                                           #
@@ -225,14 +253,21 @@ def create_app() -> FastAPI:
     )
     async def query_to_sql(
         request: QueryRequest,
+        http_request: Request,
         api_key: str | None = Depends(get_api_key),
     ) -> QueryResponse:
         session_id = request.session_id or str(uuid.uuid4())
+        correlation_id = http_request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        tenant_id = (
+            http_request.headers.get(settings.tenant.tenant_id_header)
+            or request.tenant_id
+            or settings.tenant.default_tenant
+        )
         pipeline_start = time.monotonic()
 
         logger.info(
             "Query received", session_id=session_id,
-            preview=request.query[:80],
+            preview=request.query[:80], cid=correlation_id,
         )
         try:
             from agents.runner import run_prism_query
@@ -242,6 +277,8 @@ def create_app() -> FastAPI:
                 database_name=request.database_name,
                 max_rows=request.max_rows,
                 execute_query=request.execute_query,
+                correlation_id=correlation_id,
+                tenant_id=tenant_id,
             )
             pipeline_ms = round((time.monotonic() - pipeline_start) * 1000, 2)
             return QueryResponse(
@@ -267,6 +304,11 @@ def create_app() -> FastAPI:
                 cache_hit=result.get("cache_hit", False),
                 cache_source=result.get("cache_source"),
                 cost_warning=result.get("cost_warning"),
+                pii_report=result.get("pii_report"),
+                anomalies=result.get("anomalies", []),
+                correlation_id=correlation_id,
+                token_input=result.get("token_input"),
+                token_output=result.get("token_output"),
             )
         except Exception as e:
             logger.error("Pipeline error", error=str(e), session_id=session_id)
@@ -643,6 +685,257 @@ def create_app() -> FastAPI:
         except Exception:
             pass
         return {"status": "resolved", "id": item_id}
+
+    # ---- Prometheus metrics -------------------------------------------
+
+    @app.get(
+        "/metrics",
+        include_in_schema=False,
+        tags=["System"],
+        summary="Prometheus metrics endpoint",
+    )
+    async def prometheus_metrics():
+        """Expose Prometheus metrics in text/plain format."""
+        try:
+            from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+            from fastapi.responses import Response as FastAPIResponse
+            return FastAPIResponse(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+        except ImportError:
+            # Fallback: return basic stats as plain text
+            from core.telemetry import get_metrics_snapshot
+            snapshot = get_metrics_snapshot()
+            lines = [f"# HELP text2sql_queries_total Total queries processed"]
+            lines.append(f"# TYPE text2sql_queries_total counter")
+            for k, v in snapshot.items():
+                if isinstance(v, (int, float)):
+                    safe_k = k.replace("-", "_").replace(" ", "_")
+                    lines.append(f"text2sql_{safe_k} {v}")
+            return JSONResponse({"raw": "\n".join(lines)})
+
+    # ---- Rate limit stats ---------------------------------------------
+
+    @app.get(
+        "/api/v1/rate-limit",
+        response_model=RateLimitStats,
+        tags=["System"],
+        summary="Rate limit usage for current user",
+    )
+    async def rate_limit_stats(
+        request: Request,
+        api_key: str | None = Depends(get_api_key),
+    ) -> RateLimitStats:
+        from core.rate_limiter import get_rate_limit_stats
+        user_id = request.headers.get("X-User-ID")
+        stats = get_rate_limit_stats(user_id=user_id)
+        return RateLimitStats(**stats)
+
+    # ---- Saved Queries ------------------------------------------------
+
+    @app.get(
+        "/api/v1/saved-queries",
+        response_model=list[SavedQuery],
+        tags=["Saved Queries"],
+        summary="List saved/named query templates",
+    )
+    async def list_saved_queries_endpoint(
+        request: Request,
+        tag: str | None = Query(default=None),
+        limit: int = Query(default=50, ge=1, le=500),
+        api_key: str | None = Depends(get_api_key),
+    ) -> list[SavedQuery]:
+        from core.saved_queries import list_saved_queries, extract_params
+        user_id = request.headers.get("X-User-ID", "default")
+        tenant_id = request.headers.get(settings.tenant.tenant_id_header, "default")
+        items = await list_saved_queries(user_id=user_id, tenant_id=tenant_id, limit=limit, tag=tag)
+        return [
+            SavedQuery(
+                **{k: v for k, v in item.items() if k in SavedQuery.model_fields},
+                params=extract_params(item.get("nl_query", "")),
+            )
+            for item in items
+        ]
+
+    @app.post(
+        "/api/v1/saved-queries",
+        response_model=SavedQuery,
+        tags=["Saved Queries"],
+        summary="Save a named query template",
+        status_code=201,
+    )
+    async def create_saved_query(
+        request: Request,
+        body: SavedQueryRequest,
+        api_key: str | None = Depends(get_api_key),
+    ) -> SavedQuery:
+        from core.saved_queries import save_query, get_saved_query, extract_params
+        user_id = request.headers.get("X-User-ID", "default")
+        tenant_id = request.headers.get(settings.tenant.tenant_id_header, "default")
+        await save_query(
+            name=body.name,
+            nl_query=body.nl_query,
+            description=body.description,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            tags=body.tags,
+        )
+        item = await get_saved_query(body.name, user_id=user_id, tenant_id=tenant_id)
+        if not item:
+            raise HTTPException(status_code=500, detail="Failed to retrieve saved query after creation")
+        return SavedQuery(
+            **{k: v for k, v in item.items() if k in SavedQuery.model_fields},
+            params=extract_params(item.get("nl_query", "")),
+        )
+
+    @app.post(
+        "/api/v1/saved-queries/{name}/run",
+        response_model=QueryResponse,
+        tags=["Saved Queries"],
+        summary="Execute a saved query with parameter substitution",
+    )
+    async def run_saved_query(
+        name: str,
+        body: SavedQueryRunRequest,
+        request: Request,
+        api_key: str | None = Depends(get_api_key),
+    ) -> QueryResponse:
+        from core.saved_queries import get_saved_query, populate_params
+        from agents.runner import run_prism_query
+        user_id = request.headers.get("X-User-ID", "default")
+        tenant_id = request.headers.get(settings.tenant.tenant_id_header, "default")
+
+        saved = await get_saved_query(name, user_id=user_id, tenant_id=tenant_id)
+        if not saved:
+            raise HTTPException(status_code=404, detail=f"Saved query '{name}' not found")
+
+        nl_query = populate_params(saved["nl_query"], body.params)
+        session_id = body.session_id or str(uuid.uuid4())
+        correlation_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+
+        result = await run_prism_query(
+            query=nl_query,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            tenant_id=tenant_id,
+            max_rows=body.max_rows,
+        )
+        return QueryResponse(
+            success=result.get("success", False),
+            session_id=session_id,
+            query=nl_query,
+            generated_sql=result.get("generated_sql"),
+            optimized_sql=result.get("optimized_sql"),
+            columns=result.get("columns", []),
+            rows=result.get("rows", []),
+            row_count=result.get("row_count", 0),
+            truncated=result.get("truncated", False),
+            answer=result.get("answer"),
+            confidence=result.get("confidence", 0.0),
+            pipeline_stages=result.get("pipeline_stages", []),
+            execution_time_ms=result.get("execution_time_ms", 0.0),
+            pipeline_time_ms=result.get("pipeline_time_ms", 0.0),
+            error=result.get("error"),
+            suggestions=result.get("suggestions", []),
+            needs_clarification=result.get("needs_clarification", False),
+            cache_hit=result.get("cache_hit", False),
+            pii_report=result.get("pii_report"),
+            anomalies=result.get("anomalies", []),
+            correlation_id=correlation_id,
+            token_input=result.get("token_input"),
+            token_output=result.get("token_output"),
+        )
+
+    @app.delete(
+        "/api/v1/saved-queries/{name}",
+        tags=["Saved Queries"],
+        summary="Delete a saved query",
+    )
+    async def delete_saved_query_endpoint(
+        name: str,
+        request: Request,
+        api_key: str | None = Depends(get_api_key),
+    ) -> dict[str, Any]:
+        from core.saved_queries import delete_saved_query
+        user_id = request.headers.get("X-User-ID", "default")
+        tenant_id = request.headers.get(settings.tenant.tenant_id_header, "default")
+        deleted = await delete_saved_query(name, user_id=user_id, tenant_id=tenant_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Saved query '{name}' not found")
+        return {"status": "deleted", "name": name}
+
+    # ---- Result Export ------------------------------------------------
+
+    @app.get(
+        "/api/v1/history/{query_id}/export",
+        tags=["History"],
+        summary="Export query results as CSV, JSON, or Excel",
+    )
+    async def export_query_results(
+        query_id: str,
+        format: ExportFormat = Query(default=ExportFormat.json),
+        api_key: str | None = Depends(get_api_key),
+    ):
+        from core.audit_log import get_query_history
+
+        # Fetch from audit log (only metadata stored, not rows)
+        rows_data = await get_query_history(limit=1, offset=0)
+        # For a full export we'd need to re-execute; return the audit record
+        # In production, rows should be cached with the query_id
+        history = [r for r in rows_data if r.get("query_id") == query_id]
+        if not history:
+            raise HTTPException(status_code=404, detail=f"Query '{query_id}' not found in history")
+
+        record = history[0]
+
+        if format == ExportFormat.json:
+            return JSONResponse(content=record)
+
+        if format == ExportFormat.csv:
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=list(record.keys()))
+            writer.writeheader()
+            writer.writerow(record)
+            return StreamingResponse(
+                iter([output.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=query_{query_id}.csv"},
+            )
+
+        if format == ExportFormat.excel:
+            try:
+                import openpyxl
+                import io
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.append(list(record.keys()))
+                ws.append([str(v) for v in record.values()])
+                buf = io.BytesIO()
+                wb.save(buf)
+                buf.seek(0)
+                return StreamingResponse(
+                    buf,
+                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=query_{query_id}.xlsx"},
+                )
+            except ImportError:
+                raise HTTPException(status_code=422, detail="openpyxl not installed. Use csv or json format.")
+
+    # ---- Performance regression report --------------------------------
+
+    @app.get(
+        "/api/v1/performance/slow-queries",
+        response_model=list[PerformanceBaseline],
+        tags=["System"],
+        summary="Slowest query patterns by p95 latency",
+    )
+    async def slow_query_report(
+        limit: int = Query(default=20, ge=1, le=100),
+        api_key: str | None = Depends(get_api_key),
+    ) -> list[PerformanceBaseline]:
+        from core.performance_tracker import get_slow_query_report
+        rows = await get_slow_query_report(limit=limit)
+        return [PerformanceBaseline(**r) for r in rows]
 
     # ---- Metrics -------------------------------------------------------
 

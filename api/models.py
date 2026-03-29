@@ -4,6 +4,7 @@ Pydantic models for all Text2SQL PRISM REST endpoints.
 """
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -24,6 +25,7 @@ class QueryRequest(BaseModel):
     max_rows: int = Field(default=100, ge=1, le=1000)
     execute_query: bool = Field(default=True)
     explain_results: bool = Field(default=True)
+    tenant_id: str = Field(default="default", description="Tenant scope for glossary/few-shot isolation")
 
 
 class QueryResponse(BaseModel):
@@ -51,6 +53,9 @@ class QueryResponse(BaseModel):
     cost_warning: str | None = None
     pii_report: dict[str, Any] | None = None
     anomalies: list[str] = Field(default_factory=list)
+    correlation_id: str | None = None
+    token_input: int | None = None
+    token_output: int | None = None
 
 
 # ------------------------------------------------------------------ #
@@ -234,4 +239,70 @@ class DeadLetterResponse(BaseModel):
 
 class ResolveDeadLetterRequest(BaseModel):
     corrected_sql: str = Field(min_length=5)
+
+
+# ------------------------------------------------------------------ #
+# Saved Queries                                                        #
+# ------------------------------------------------------------------ #
+
+class SavedQueryRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100, description="Unique name for this saved query")
+    nl_query: str = Field(min_length=3, max_length=2000, description="Query template with optional {param} placeholders")
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class SavedQuery(BaseModel):
+    id: str
+    name: str
+    nl_query: str
+    description: str = ""
+    user_id: str = "default"
+    tenant_id: str = "default"
+    tags: list[str] = Field(default_factory=list)
+    use_count: int = 0
+    last_used_at: float | None = None
+    created_at: float = 0.0
+    params: list[str] = Field(default_factory=list, description="Parameter names found in the template")
+
+
+class SavedQueryRunRequest(BaseModel):
+    params: dict[str, str] = Field(default_factory=dict, description="Parameter values to substitute")
+    session_id: str | None = None
+    max_rows: int = Field(default=100, ge=1, le=1000)
+
+
+# ------------------------------------------------------------------ #
+# Export                                                               #
+# ------------------------------------------------------------------ #
+
+class ExportFormat(str, Enum):
+    csv = "csv"
+    json = "json"
+    excel = "excel"
+
+
+# ------------------------------------------------------------------ #
+# Performance                                                          #
+# ------------------------------------------------------------------ #
+
+class PerformanceBaseline(BaseModel):
+    fingerprint: str
+    ema_ms: float
+    p95_ms: float | None = None
+    sample_count: int = 0
+    last_updated_at: float | None = None
+
+
+# ------------------------------------------------------------------ #
+# Rate Limit                                                           #
+# ------------------------------------------------------------------ #
+
+class RateLimitStats(BaseModel):
+    user_id: str
+    requests_last_minute: int
+    requests_last_hour: int
+    limit_per_minute: int
+    limit_per_hour: int
+    rate_limiting_enabled: bool
 

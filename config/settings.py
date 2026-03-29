@@ -242,6 +242,51 @@ class APISettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
+class RateLimitSettings(BaseSettings):
+    """Per-user / per-API-key request throttling."""
+    enabled: bool = Field(default=False, description="Enable rate limiting (disabled by default)")
+    requests_per_minute: int = Field(default=60, ge=1)
+    requests_per_hour: int = Field(default=500, ge=1)
+    burst_limit: int = Field(
+        default=10, ge=1,
+        description="Max concurrent sliding-window requests in a 10-second burst",
+    )
+
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="RATE_LIMIT_", extra="ignore")
+
+
+class AllowlistSettings(BaseSettings):
+    """SQL and database access control."""
+    enabled: bool = Field(default=False, description="Enable allowlist/blocklist checks")
+    # Regex patterns against the NL query or generated SQL
+    blocked_table_patterns: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns; if SQL matches any, the query is rejected",
+    )
+    blocked_sql_patterns: list[str] = Field(
+        default_factory=list,
+        description="Regex patterns checked against raw NL query before pipeline",
+    )
+    allowed_databases: list[str] = Field(
+        default_factory=list,
+        description="If non-empty, only these database names are accepted",
+    )
+
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="ALLOWLIST_", extra="ignore")
+
+
+class TenantSettings(BaseSettings):
+    """Multi-tenant isolation for glossary and few-shot examples."""
+    enabled: bool = Field(default=False, description="Enable tenant-scoped isolation")
+    tenant_id_header: str = Field(
+        default="X-Tenant-ID",
+        description="HTTP header name to extract tenant ID from",
+    )
+    default_tenant: str = Field(default="default")
+
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="TENANT_", extra="ignore")
+
+
 class ObservabilitySettings(BaseSettings):
     enable_tracing: bool = Field(default=False)
     otel_exporter_otlp_endpoint: str = Field(default="http://localhost:4317")
@@ -281,6 +326,9 @@ class Settings(BaseSettings):
     feedback: FeedbackSettings = Field(default_factory=FeedbackSettings)
     api: APISettings = Field(default_factory=APISettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    allowlist: AllowlistSettings = Field(default_factory=AllowlistSettings)
+    tenant: TenantSettings = Field(default_factory=TenantSettings)
 
     model_config = SettingsConfigDict(
         env_file=".env",
