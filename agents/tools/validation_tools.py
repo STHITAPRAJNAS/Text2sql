@@ -411,3 +411,120 @@ def check_performance_safety(
         "has_limit": has_limit,
         "has_where": has_where,
     }
+
+
+def check_query_complexity(sql: str) -> dict[str, Any]:
+    """
+    Estimate query complexity and enforce a budget.
+
+    Counts structural elements that drive planning cost and execution risk.
+    Returns a complexity score and blocks queries that exceed the hard limit.
+
+    Complexity score:
+      - Each JOIN:           +1
+      - Each subquery:       +2
+      - Each window func:    +1
+      - Each CTE:            +1
+      - Each UNION/EXCEPT:   +1
+      - CROSS JOIN:          +4 (high risk)
+
+    Thresholds (configurable via settings):
+      score ≤ 8:  SIMPLE/MODERATE   — green
+      score ≤ 15: COMPLEX            — yellow (warn)
+      score > 15: ADVANCED           — red (block by default if block_advanced=True)
+
+    Args:
+        sql: The SQL query to analyze
+
+    Returns:
+        {
+          "complexity_score": int,
+          "level": "SIMPLE" | "MODERATE" | "COMPLEX" | "ADVANCED",
+          "breakdown": {join_count, subquery_count, window_count, cte_count, ...},
+          "blocked": bool,
+          "block_reason": str | None,
+          "suggestions": list[str],
+        }
+    """
+    sql_upper = sql.upper()
+
+    # Count structural elements
+    join_count = len(re.findall(r'\bJOIN\b', sql_upper))
+    cross_join_count = len(re.findall(r'\bCROSS\s+JOIN\b', sql_upper))
+    subquery_count = sql_upper.count('(SELECT')
+    window_count = len(re.findall(r'\bOVER\s*\(', sql_upper))
+    cte_count = len(re.findall(r'\bWITH\b', sql_upper))
+    set_op_count = len(re.findall(r'\b(UNION|INTERSECT|EXCEPT)\b', sql_upper))
+
+    score = (
+        join_count
+        + cross_join_count * 4
+        + subquery_count * 2
+        + window_count
+        + cte_count
+        + set_op_count
+    )
+
+    if score <= 3:
+        level = "SIMPLE"
+    elif score <= 8:
+        level = "MODERATE"
+    elif score <= 15:
+        level = "COMPLEX"
+    else:
+        level = "ADVANCED"
+
+    suggestions = []
+    blocked = False
+    block_reason = None
+
+    if cross_join_count > 0:
+        suggestions.append(
+            "CROSS JOIN detected — ensure this is intentional. "
+            "Consider explicit JOIN ... ON conditions."
+        )
+
+    if subquery_count > 3:
+        suggestions.append(
+            "Many nested subqueries reduce readability and may hurt performance. "
+            "Consider rewriting with CTEs (WITH clauses)."
+        )
+
+    if join_count > 8:
+        suggestions.append(
+            f"{join_count} JOINs detected. Consider breaking into intermediate CTEs "
+            "or views to improve maintainability and optimizer hints."
+        )
+
+    if level == "ADVANCED":
+        suggestions.append(
+            "Query complexity exceeds typical thresholds. "
+            "Verify with EXPLAIN before running on large tables."
+        )
+        # Only block if settings say so
+        try:
+            from config.settings import get_settings
+            if get_settings().deep_think.block_advanced_queries:
+                blocked = True
+                block_reason = (
+                    f"Query complexity score {score} exceeds maximum allowed (15). "
+                    "Simplify the query or increase block_advanced_queries threshold."
+                )
+        except Exception:
+            pass
+
+    return {
+        "complexity_score": score,
+        "level": level,
+        "breakdown": {
+            "join_count": join_count,
+            "cross_join_count": cross_join_count,
+            "subquery_count": subquery_count,
+            "window_count": window_count,
+            "cte_count": cte_count,
+            "set_op_count": set_op_count,
+        },
+        "blocked": blocked,
+        "block_reason": block_reason,
+        "suggestions": suggestions,
+    }

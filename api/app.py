@@ -31,23 +31,30 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
 
 from api.models import (
     CacheStatsResponse,
+    DeadLetterItem,
+    DeadLetterResponse,
     ExampleRequest,
     ExampleResponse,
     FeedbackRequest,
     FeedbackResponse,
+    GlossaryTerm,
+    GlossaryUpsertRequest,
     HealthResponse,
+    HistoryItem,
+    HistoryResponse,
     IndexRequest,
     IndexResponse,
     QueryRequest,
     QueryResponse,
+    ResolveDeadLetterRequest,
     SchemaIndexListResponse,
     SchemaResponse,
 )
@@ -127,7 +134,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.api.allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["*"],
     )
     app.add_middleware(GZipMiddleware, minimum_size=1000)
@@ -430,6 +437,213 @@ def create_app() -> FastAPI:
             error=result.get("error"),
         )
 
+    # ---- SSE Streaming query ------------------------------------------
+
+    @app.get(
+        "/api/v1/query/stream",
+        tags=["Text2SQL"],
+        summary="Stream NL→SQL pipeline events via SSE",
+        description=(
+            "Server-Sent Events stream of pipeline progress. "
+            "Events: phase, token, sql, result, error, done."
+        ),
+    )
+    async def stream_query(
+        q: str = Query(min_length=3, max_length=2000, description="Natural language question"),
+        database_name: str = Query(default="default"),
+        session_id: str | None = Query(default=None),
+        max_rows: int = Query(default=100, ge=1, le=1000),
+        api_key: str | None = Depends(get_api_key),
+    ):
+        from agents.runner import stream_prism_query
+
+        async def event_generator():
+            async for event in stream_prism_query(
+                query=q,
+                session_id=session_id,
+                database_name=database_name,
+                max_rows=max_rows,
+                execute_query=True,
+            ):
+                yield event
+
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # ---- Glossary CRUD ------------------------------------------------
+
+    @app.get(
+        "/api/v1/glossary",
+        response_model=list[GlossaryTerm],
+        tags=["Glossary"],
+        summary="List all business glossary terms",
+    )
+    async def list_glossary(
+        search: str | None = Query(default=None, description="Keyword search"),
+        limit: int = Query(default=200, ge=1, le=1000),
+        api_key: str | None = Depends(get_api_key),
+    ) -> list[GlossaryTerm]:
+        from core.glossary import list_all, search as glossary_search
+        if search:
+            items = await glossary_search(search, limit=limit)
+        else:
+            items = await list_all(limit=limit)
+        return [GlossaryTerm(**item) for item in items]
+
+    @app.get(
+        "/api/v1/glossary/{term}",
+        response_model=GlossaryTerm,
+        tags=["Glossary"],
+        summary="Look up a single business term",
+    )
+    async def get_glossary_term(
+        term: str,
+        api_key: str | None = Depends(get_api_key),
+    ) -> GlossaryTerm:
+        from core.glossary import lookup
+        entry = await lookup(term)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"Term '{term}' not found")
+        return GlossaryTerm(**entry)
+
+    @app.post(
+        "/api/v1/glossary",
+        response_model=GlossaryTerm,
+        tags=["Glossary"],
+        summary="Add or update a business glossary term",
+        status_code=201,
+    )
+    async def upsert_glossary_term(
+        request: GlossaryUpsertRequest,
+        api_key: str | None = Depends(get_api_key),
+    ) -> GlossaryTerm:
+        from core.glossary import upsert, lookup
+        await upsert(
+            term=request.term,
+            table_name=request.table_name,
+            column_name=request.column_name,
+            filter_sql=request.filter_sql,
+            description=request.description,
+            example_sql=request.example_sql,
+        )
+        entry = await lookup(request.term)
+        return GlossaryTerm(**(entry or {"term": request.term}))
+
+    @app.delete(
+        "/api/v1/glossary/{term}",
+        tags=["Glossary"],
+        summary="Delete a business glossary term",
+    )
+    async def delete_glossary_term(
+        term: str,
+        api_key: str | None = Depends(get_api_key),
+    ) -> dict[str, Any]:
+        from core.glossary import delete
+        deleted = await delete(term)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Term '{term}' not found")
+        return {"status": "deleted", "term": term}
+
+    # ---- Query History ------------------------------------------------
+
+    @app.get(
+        "/api/v1/history",
+        response_model=HistoryResponse,
+        tags=["History"],
+        summary="Query history for a user or session",
+    )
+    async def get_history(
+        user_id: str | None = Query(default=None),
+        session_id: str | None = Query(default=None),
+        limit: int = Query(default=20, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+        api_key: str | None = Depends(get_api_key),
+    ) -> HistoryResponse:
+        from core.audit_log import get_query_history
+        rows = await get_query_history(
+            user_id=user_id, session_id=session_id, limit=limit, offset=offset
+        )
+        items = [
+            HistoryItem(
+                query_id=r.get("query_id", ""),
+                nl_query=r.get("nl_query", ""),
+                generated_sql=r.get("generated_sql"),
+                success=bool(r.get("success")),
+                confidence=float(r.get("confidence") or 0.0),
+                execution_time_ms=float(r.get("execution_time_ms") or 0.0),
+                pipeline_time_ms=float(r.get("pipeline_time_ms") or 0.0),
+                row_count=int(r.get("row_count") or 0),
+                cache_hit=bool(r.get("cache_hit")),
+                cache_source=r.get("cache_source"),
+                pii_detected=bool(r.get("pii_detected")),
+                cost_warning=r.get("cost_warning"),
+                needs_clarification=bool(r.get("needs_clarification")),
+                created_at=float(r.get("created_at") or 0.0),
+            )
+            for r in rows
+        ]
+        return HistoryResponse(items=items, total=len(items), limit=limit, offset=offset)
+
+    # ---- Dead Letter Queue --------------------------------------------
+
+    @app.get(
+        "/api/v1/review-queue",
+        response_model=DeadLetterResponse,
+        tags=["Review Queue"],
+        summary="Failed queries pending human review",
+    )
+    async def get_review_queue(
+        reviewed: bool | None = Query(default=False, description="Filter by reviewed status"),
+        limit: int = Query(default=50, ge=1, le=500),
+        api_key: str | None = Depends(get_api_key),
+    ) -> DeadLetterResponse:
+        from core.audit_log import get_dead_letters
+        rows = await get_dead_letters(reviewed=reviewed, limit=limit)
+        items = [
+            DeadLetterItem(
+                id=r.get("id", ""),
+                query_id=r.get("query_id", ""),
+                nl_query=r.get("nl_query", ""),
+                generated_sql=r.get("generated_sql"),
+                error=r.get("error", ""),
+                failure_reason=r.get("failure_reason", ""),
+                database_name=r.get("database_name", "default"),
+                confidence=float(r.get("confidence") or 0.0),
+                reviewed=bool(r.get("reviewed")),
+                corrected_sql=r.get("corrected_sql"),
+                created_at=float(r.get("created_at") or 0.0),
+            )
+            for r in rows
+        ]
+        return DeadLetterResponse(items=items, total=len(items))
+
+    @app.post(
+        "/api/v1/review-queue/{item_id}/resolve",
+        tags=["Review Queue"],
+        summary="Mark a dead letter as resolved with corrected SQL",
+    )
+    async def resolve_dead_letter(
+        item_id: str,
+        request: ResolveDeadLetterRequest,
+        api_key: str | None = Depends(get_api_key),
+    ) -> dict[str, Any]:
+        from core.audit_log import resolve_dead_letter as _resolve
+        ok = await _resolve(item_id, request.corrected_sql)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Dead letter '{item_id}' not found")
+        # Also add to few-shot store for auto-improvement
+        try:
+            from agents.tools.few_shot_tools import add_example_to_store
+            add_example_to_store(
+                question="",
+                sql=request.corrected_sql,
+                database_name="default",
+                tags=["dead_letter_correction"],
+                feedback_score=1.0,
+            )
+        except Exception:
+            pass
+        return {"status": "resolved", "id": item_id}
+
     # ---- Metrics -------------------------------------------------------
 
     @app.get("/api/v1/metrics", tags=["System"], summary="Telemetry + cache + feedback metrics")
@@ -459,6 +673,13 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
+        calibration_stats = {}
+        try:
+            from core.audit_log import get_calibration_stats
+            calibration_stats = await get_calibration_stats()
+        except Exception:
+            pass
+
         return {
             "service": "text2sql-prism",
             "version": "1.0.0",
@@ -466,6 +687,7 @@ def create_app() -> FastAPI:
             "telemetry": telemetry,
             "cache": cache_stats,
             "feedback": feedback_stats,
+            "calibration": calibration_stats,
             "agents": {
                 "schema_discovery": "ready",
                 "metadata_enrichment": "ready",

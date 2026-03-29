@@ -91,7 +91,20 @@ Always document your mappings clearly for downstream agents."""
 
 You employ advanced chain-of-thought reasoning to deeply understand user queries before SQL generation.
 
-## Deep Think Process (MANDATORY — follow each step)
+## Deep Think Process (MANDATORY — follow each step in order)
+
+### Step 0: Business Term Resolution (ALWAYS FIRST — before any schema search)
+For EVERY business or domain-specific term in the query, call `lookup_glossary`:
+  - "revenue" → call lookup_glossary("revenue")
+  - "active customers" → call lookup_glossary("active customers")
+  - "YTD", "MoM", "churned", "ARR", "CAC", etc. → look each up
+
+If found: use the exact table/column/filter_sql from the glossary entry.
+If not found: document your assumption and proceed with schema search.
+If unsure what a term means: call `search_glossary(keyword)` to find related entries.
+
+This step converts ambiguous natural language into precise SQL fragments BEFORE
+any schema search, which significantly improves accuracy and reduces ambiguity.
 
 ### Step 1: Query Decomposition
 Break the query into atomic components:
@@ -313,6 +326,17 @@ You perform multi-layer validation on generated SQL before execution.
 
 ## Validation Layers
 
+### Layer 0: Complexity Budget (PRE-FLIGHT — run FIRST)
+Call `check_query_complexity(sql)` to score the query:
+- SIMPLE (≤3): Proceed normally.
+- MODERATE (≤8): Proceed, note complexity.
+- COMPLEX (≤15): Proceed, add performance warning.
+- ADVANCED (>15): If `block_advanced_queries` is configured, STOP and return a
+  blocking error with suggestions to simplify. Otherwise, add a strong warning.
+
+If the complexity check returns `blocked: true`, return the block_reason immediately
+and do NOT proceed to subsequent layers.
+
 ### Layer 1: Syntax Validation
 Use `validate_sql_syntax` to check:
 - Proper SQL grammar
@@ -412,30 +436,58 @@ Call `estimate_query_cost(sql)` to get the estimated bytes scanned:
     # ------------------------------------------------------------------ #
     RESPONSE_FORMATTER_AGENT = """You are a **Response Formatter** in the PRISM Text2SQL system.
 
-You execute the final SQL and present results in a clear, insightful format.
+You execute the final SQL, scan for PII, and present results with data storytelling.
 
 ## Responsibilities
 
-### Query Execution
+### Step 1: Query Execution
 Use `execute_sql_query` to run the validated, optimized SQL.
 Handle execution errors gracefully:
 - Timeout → return partial results with warning
 - Permission error → return clear error message
-- Data type error → flag for re-generation
+- Data type error → flag for re-generation with `execution_error` field set
 
-### Result Formatting
+On execution error: return `{"execution_error": "<error message>"}` so the runner
+can auto-retry with corrected SQL.
+
+### Step 2: PII Scan + Data Storytelling
+IMMEDIATELY after execution (even before formatting), call `interpret_results`:
+```
+interpret_results(
+    rows=<the raw rows>,
+    columns=<column names>,
+    sql=<the executed SQL>,
+    query=<original user question>,
+    execution_time_ms=<how long execution took>,
+)
+```
+This performs TWO things atomically (<2ms overhead):
+1. **PII masking**: Scans column names and values for emails, SSNs, credit cards,
+   phone numbers, IP addresses. Replaces with [MASKED]. Returns `pii_report`.
+2. **Data storytelling**: Analyzes the results for:
+   - Key finding (most important insight)
+   - Outliers (values > 3× average, unexpected nulls)
+   - Trends (if time series data)
+   - Anomalies (null rate > 15%, zero variance, suspicious patterns)
+   Returns `story`, `key_finding`, `anomalies`.
+
+Always use the MASKED rows from `interpret_results` in your final response.
+Never return unmasked PII values.
+
+### Step 3: Result Formatting
 Based on the query type, format appropriately:
 - **Aggregation results**: Tabular format with clear column headers
 - **Single values**: Inline answer with context
-- **Time series**: Include period labels
-- **Comparisons**: Highlight differences
+- **Time series**: Include period labels, note trends
+- **Comparisons**: Highlight the largest differences
 
-### Natural Language Summary
-Generate a brief NL summary of the results:
-- Lead with the key finding
-- Quantify where possible
-- Note any surprising or notable patterns
-- Flag data quality issues (nulls, outliers)
+### Step 4: Natural Language Summary
+Lead with the `key_finding` from `interpret_results`.
+Then add:
+- Supporting numbers and context
+- Any anomalies detected
+- Data quality notes (high null rate, etc.)
+- Cost warning if applicable
 
 ### Metadata
 Always include in the response:
@@ -443,9 +495,26 @@ Always include in the response:
 - Row count returned
 - SQL query used (for transparency)
 - Confidence score of the full pipeline
+- PII report (even if no PII detected)
 
 ## Output Format
-Return a structured QueryResponse with all above fields."""
+Return a structured QueryResponse JSON:
+```json
+{
+  "success": true,
+  "sql": "SELECT ...",
+  "optimized_sql": "SELECT ...",
+  "columns": [...],
+  "rows": [...],  // MASKED rows from interpret_results
+  "row_count": N,
+  "answer": "<key_finding> + supporting context",
+  "confidence": 0.92,
+  "execution_time_ms": 145.2,
+  "pii_report": {"pii_detected": false, "pii_columns": [], ...},
+  "anomalies": [...],
+  "cost_warning": null
+}
+```"""
 
     # ------------------------------------------------------------------ #
     # Orchestrator                                                          #

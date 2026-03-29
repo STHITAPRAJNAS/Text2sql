@@ -3,14 +3,22 @@ PRISM ADK Runner
 ================
 Bridges the FastAPI layer and the Google ADK multi-agent system.
 
-Handles:
-- ADK session management (DatabaseSessionService for persistence)
-- Semantic cache check (Redis L1 + ChromaDB L2) before pipeline
-- Agent invocation and response parsing
-- Clarification detection (pipeline exits early via request_clarification)
-- Memory persistence after successful queries (add_session_to_memory)
-- OpenTelemetry tracing per PRISM phase
-- Error recovery and fallback
+Latency-safe design:
+  - Semantic cache checked FIRST (L1 Redis + L2 ChromaDB) — skip pipeline on hit
+  - Audit log writes are fire-and-forget (asyncio.create_task)
+  - PII scan happens inside response_formatter (< 2ms)
+  - Glossary lookups are in-memory O(1) in Phase R
+  - Auto-retry fires only when SQL execution fails (rare path, ~10% worst case)
+
+Features:
+  - ADK DatabaseSessionService for persistent multi-turn sessions
+  - Semantic cache (Redis L1 + ChromaDB L2) before pipeline
+  - Auto-retry on SQL execution error (max 2 retries, error fed back to generator)
+  - Audit log (fire-and-forget to SQLite/PostgreSQL)
+  - Dead letter queue for persistent failures
+  - Clarification detection
+  - Memory persistence via after_agent_callback
+  - OpenTelemetry per-phase spans
 """
 from __future__ import annotations
 
@@ -18,10 +26,12 @@ import json
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import structlog
+
 from config.settings import get_settings
+from core.telemetry import trace_phase, record_query
 
 try:
     from google.genai import types as genai_types
@@ -29,183 +39,165 @@ try:
 except ImportError:
     genai_types = None  # type: ignore
     get_orchestrator = None  # type: ignore
-from core.telemetry import trace_phase, record_query, get_metrics_snapshot
 
 logger = structlog.get_logger(__name__)
 
 APP_NAME = "text2sql_prism"
-
-# Runner singleton
 _runner = None
 
 
 def _get_runner():
-    """Get or create the ADK Runner singleton (InMemoryRunner or DatabaseSessionService-backed)."""
     global _runner
     if _runner is not None:
         return _runner
 
     orchestrator = get_orchestrator()
 
-    # Try to use Runner with DatabaseSessionService for persistent sessions
     try:
         from google.adk.runners import Runner
         from core.session_store import get_session_service
         session_service = get_session_service()
         if session_service is not None:
-            _runner = Runner(
-                agent=orchestrator,
-                app_name=APP_NAME,
-                session_service=session_service,
-            )
+            _runner = Runner(agent=orchestrator, app_name=APP_NAME, session_service=session_service)
             logger.info("ADK Runner initialized with DatabaseSessionService", app=APP_NAME)
             return _runner
     except (ImportError, Exception) as e:
-        logger.debug("Runner with session service failed, trying InMemoryRunner", error=str(e))
+        logger.debug("Runner with session service failed", error=str(e))
 
-    # Fallback to InMemoryRunner
-    try:
-        from google.adk.runners import InMemoryRunner
-        _runner = InMemoryRunner(agent=orchestrator, app_name=APP_NAME)
-        logger.info("ADK InMemoryRunner initialized", app=APP_NAME)
-    except ImportError as e:
-        logger.error("google-adk not installed", error=str(e))
-        raise
-
+    from google.adk.runners import InMemoryRunner
+    _runner = InMemoryRunner(agent=orchestrator, app_name=APP_NAME)
+    logger.info("ADK InMemoryRunner initialized", app=APP_NAME)
     return _runner
 
 
-def _extract_sql_from_response(text: str) -> str | None:
-    """Extract SQL from LLM response text (handles markdown code blocks)."""
-    sql_block = re.search(r"```sql\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if sql_block:
-        return sql_block.group(1).strip()
+# ------------------------------------------------------------------ #
+# Parsing helpers                                                      #
+# ------------------------------------------------------------------ #
 
-    code_block = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
-    if code_block:
-        candidate = code_block.group(1).strip()
-        if candidate.upper().startswith(("SELECT", "WITH")):
-            return candidate
+def _extract_sql(text: str) -> str | None:
+    m = re.search(r"```sql\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
+    if m:
+        c = m.group(1).strip()
+        if c.upper().startswith(("SELECT", "WITH")):
+            return c
+    m = re.search(r"((?:WITH|SELECT)\s+.+?)(?:\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else None
 
-    select_match = re.search(r"((?:WITH|SELECT)\s+.+?)(?:\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
-    if select_match:
-        return select_match.group(1).strip()
 
+def _extract_json(text: str) -> dict[str, Any] | None:
+    m = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    m = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
     return None
 
 
-def _extract_json_from_response(text: str) -> dict[str, Any] | None:
-    """Extract JSON object from LLM response text."""
-    json_block = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if json_block:
-        try:
-            return json.loads(json_block.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-    if json_match:
-        try:
-            return json.loads(json_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return None
-
-
-def _check_clarification_in_response(text: str) -> dict[str, Any] | None:
-    """Detect if the response contains a clarification request."""
-    # Structural JSON clarification
-    json_data = _extract_json_from_response(text)
-    if json_data and json_data.get("needs_clarification"):
-        return json_data
-
-    # Pattern match for clarification signal
+def _check_clarification(text: str) -> dict[str, Any] | None:
+    j = _extract_json(text)
+    if j and j.get("needs_clarification"):
+        return j
     if re.search(r"needs_clarification.*?true|clarification.*?needed", text, re.IGNORECASE | re.DOTALL):
-        question_match = re.search(
-            r'"question"\s*:\s*"([^"]+)"', text, re.IGNORECASE
-        )
-        question = question_match.group(1) if question_match else text[:200]
+        q = re.search(r'"question"\s*:\s*"([^"]+)"', text)
         return {
             "needs_clarification": True,
-            "question": question,
+            "question": q.group(1) if q else text[:200],
             "options": [],
             "ambiguities": [],
         }
-
     return None
 
 
-def _parse_agent_response(response_text: str) -> dict[str, Any]:
-    """Parse the agent's final response text into a structured result."""
+def _parse_response(text: str) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "success": False,
-        "generated_sql": None,
-        "optimized_sql": None,
-        "answer": None,
-        "columns": [],
-        "rows": [],
-        "row_count": 0,
-        "truncated": False,
-        "confidence": 0.0,
-        "pipeline_stages": [],
-        "execution_time_ms": 0.0,
-        "error": None,
-        "suggestions": [],
-        "needs_clarification": False,
-        "clarification_question": None,
-        "clarification_options": [],
-        "cost_warning": None,
+        "success": False, "generated_sql": None, "optimized_sql": None,
+        "answer": None, "columns": [], "rows": [], "row_count": 0,
+        "truncated": False, "confidence": 0.0, "pipeline_stages": [],
+        "execution_time_ms": 0.0, "error": None, "suggestions": [],
+        "needs_clarification": False, "clarification_question": None,
+        "clarification_options": [], "cost_warning": None,
+        "pii_report": None, "anomalies": [], "execution_error": None,
     }
 
-    # Check for clarification first
-    clarification = _check_clarification_in_response(response_text)
+    clarification = _check_clarification(text)
     if clarification:
         result["needs_clarification"] = True
         result["clarification_question"] = clarification.get("question")
         result["clarification_options"] = clarification.get("options", [])
-        result["success"] = False
         return result
 
-    # Extract SQL
-    sql = _extract_sql_from_response(response_text)
+    sql = _extract_sql(text)
     if sql:
         result["generated_sql"] = sql
 
-    # Extract structured JSON result
-    json_data = _extract_json_from_response(response_text)
-    if json_data:
+    j = _extract_json(text)
+    if j:
         result.update({
-            "generated_sql": json_data.get("sql", sql),
-            "optimized_sql": json_data.get("optimized_sql"),
-            "columns": json_data.get("columns", []),
-            "rows": json_data.get("rows", []),
-            "row_count": json_data.get("row_count", 0),
-            "truncated": json_data.get("truncated", False),
-            "confidence": json_data.get("confidence", 0.0),
-            "answer": json_data.get("answer") or json_data.get("summary"),
-            "execution_time_ms": json_data.get("execution_time_ms", 0.0),
-            "cost_warning": json_data.get("cost_warning"),
+            "generated_sql": j.get("sql", sql),
+            "optimized_sql": j.get("optimized_sql"),
+            "columns": j.get("columns", []),
+            "rows": j.get("rows", []),
+            "row_count": j.get("row_count", 0),
+            "truncated": j.get("truncated", False),
+            "confidence": j.get("confidence", 0.0),
+            "answer": j.get("answer") or j.get("summary"),
+            "execution_time_ms": j.get("execution_time_ms", 0.0),
+            "cost_warning": j.get("cost_warning"),
+            "pii_report": j.get("pii_report"),
+            "anomalies": j.get("anomalies", []),
+            "execution_error": j.get("execution_error"),
         })
 
-    # Extract natural language answer
     if not result["answer"]:
-        answer_match = re.search(
-            r"(?:Answer|Summary|Result):\s*(.+?)(?:\n\n|\Z)",
-            response_text,
-            re.DOTALL | re.IGNORECASE,
-        )
-        if answer_match:
-            result["answer"] = answer_match.group(1).strip()
+        m = re.search(r"(?:Answer|Summary|Result):\s*(.+?)(?:\n\n|\Z)", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["answer"] = m.group(1).strip()
         else:
-            paragraphs = [p.strip() for p in response_text.split("\n\n") if p.strip()]
-            for para in paragraphs:
-                if not para.startswith(("SELECT", "WITH", "{", "```")):
+            for para in text.split("\n\n"):
+                para = para.strip()
+                if para and not para.startswith(("SELECT", "WITH", "{", "```")):
                     result["answer"] = para[:500]
                     break
 
     result["success"] = bool(result["generated_sql"])
     return result
+
+
+# ------------------------------------------------------------------ #
+# Core pipeline invocation                                             #
+# ------------------------------------------------------------------ #
+
+async def _run_pipeline_once(
+    message: str,
+    session_id: str,
+    user_id: str,
+) -> str:
+    """Run one pass of the PRISM pipeline. Returns raw response text."""
+    runner = _get_runner()
+    text = ""
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=message)],
+        ),
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    text += part.text
+    return text
 
 
 async def run_prism_query(
@@ -214,181 +206,305 @@ async def run_prism_query(
     database_name: str = "default",
     max_rows: int = 100,
     execute_query: bool = True,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Run a natural language query through the full PRISM pipeline.
 
     Flow:
-    1. Check semantic cache (L1 Redis + L2 ChromaDB) — return immediately on hit
-    2. Create/retrieve ADK session
-    3. Invoke PRISM orchestrator
-    4. Detect clarification requests
-    5. On success: cache result, record metrics, record_query telemetry
+      1. Semantic cache check (L1 Redis + L2 ChromaDB) — instant return on hit
+      2. Run PRISM pipeline once
+      3. On SQL execution error: auto-retry up to max_execution_retries times
+         with error context fed back to the generator
+      4. Fire-and-forget audit log write
+      5. Dead letter queue write on persistent failure
 
     Args:
         query: Natural language question
-        session_id: Session ID for conversation continuity
-        database_name: Target database name
+        session_id: Conversation session ID
+        database_name: Target database
         max_rows: Maximum result rows
         execute_query: Whether to execute the generated SQL
+        user_id: Caller user ID for history tracking
 
     Returns:
-        Structured result dict with SQL, results, answer, cache info, and metadata
+        Structured result dict
     """
     settings = get_settings()
     session_id = session_id or str(uuid.uuid4())
+    user_id = user_id or session_id
     pipeline_start = time.monotonic()
 
-    logger.info(
-        "Running PRISM query",
-        session_id=session_id,
-        query_preview=query[:100],
-        database=database_name,
-    )
+    logger.info("PRISM query", sid=session_id, preview=query[:80], db=database_name)
 
     # ------------------------------------------------------------------ #
-    # 1. Semantic cache check (skip if execute_query=False or clarifying) #
+    # 1. Semantic cache check                                              #
     # ------------------------------------------------------------------ #
-    if execute_query and settings.semantic_cache.enable_l1_cache or settings.semantic_cache.enable_l2_cache:
+    if execute_query:
         try:
             from core.semantic_cache import get_cached_result
             cached, cache_source = await get_cached_result(query, database_name)
             if cached is not None:
                 elapsed = (time.monotonic() - pipeline_start) * 1000
                 record_query(f"cache_hit_{cache_source.split('_')[0]}")
-                cached["session_id"] = session_id
-                cached["pipeline_time_ms"] = round(elapsed, 2)
-                cached["cache_hit"] = True
-                cached["cache_source"] = cache_source
-                logger.info(
-                    "Cache hit",
-                    source=cache_source,
-                    session_id=session_id,
-                    ms=round(elapsed, 2),
-                )
+                cached.update({
+                    "session_id": session_id, "pipeline_time_ms": round(elapsed, 2),
+                    "cache_hit": True, "cache_source": cache_source,
+                })
+                _fire_audit(cached, session_id, user_id, query, database_name)
+                logger.info("Cache hit", source=cache_source, ms=round(elapsed, 2))
                 return cached
         except Exception as exc:
-            logger.warning("Cache check failed, proceeding to pipeline", error=str(exc))
+            logger.debug("Cache check failed", error=str(exc))
 
     # ------------------------------------------------------------------ #
-    # 2. Run PRISM pipeline                                               #
+    # 2. Build user message                                                #
     # ------------------------------------------------------------------ #
+    base_message = _build_message(query, database_name, max_rows, execute_query)
+
+    # ------------------------------------------------------------------ #
+    # 3. Run pipeline with auto-retry on execution error                   #
+    # ------------------------------------------------------------------ #
+    max_retries = getattr(settings.deep_think, "max_execution_retries", 2)
+    result: dict[str, Any] = {}
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            message = base_message
+            if attempt > 0 and last_error:
+                message += (
+                    f"\n\n⚠️ Previous attempt (#{attempt}) failed at SQL execution:\n"
+                    f"Error: {last_error}\n"
+                    f"Previously generated SQL:\n```sql\n{result.get('generated_sql', '')}\n```\n"
+                    "Please generate corrected SQL that avoids this error. "
+                    "Do NOT re-run schema discovery (use cached context). "
+                    "Focus only on fixing Phase I (SQL generation) and Phase S (validation)."
+                )
+                logger.info("Auto-retry", attempt=attempt, error=last_error[:80])
+
+            with trace_phase("total", {"query": query[:80], "database": database_name, "attempt": attempt}):
+                response_text = await _run_pipeline_once(message, session_id, user_id)
+
+            result = _parse_response(response_text)
+            result.update({
+                "pipeline_time_ms": round((time.monotonic() - pipeline_start) * 1000, 2),
+                "session_id": session_id,
+                "cache_hit": False,
+                "pipeline_stages": [
+                    "schema_discovery", "metadata_enrichment", "deep_think_analysis",
+                    "schema_linking", "sql_generation", "sql_validation",
+                    "query_optimization", "response_formatting",
+                ],
+            })
+
+            # Check if Phase M reported an execution error
+            exec_err = result.get("execution_error")
+            if exec_err and attempt < max_retries:
+                last_error = str(exec_err)
+                continue  # Retry with error context
+
+            break  # Success or clarification or non-retryable failure
+
+        except Exception as e:
+            last_error = str(e)
+            if attempt == max_retries:
+                result = _error_result(session_id, query, str(e), pipeline_start)
+
+    # ------------------------------------------------------------------ #
+    # 4. Record telemetry and cache successful results                     #
+    # ------------------------------------------------------------------ #
+    if result.get("needs_clarification"):
+        record_query("clarification_needed")
+    elif result.get("success"):
+        record_query("success")
+        if execute_query:
+            try:
+                from core.semantic_cache import cache_result
+                await cache_result(query, database_name, result)
+            except Exception:
+                pass
+    else:
+        record_query("failed")
+        # Write to dead letter queue for human review
+        if not result.get("needs_clarification"):
+            from core.audit_log import log_dead_letter
+            log_dead_letter(
+                nl_query=query,
+                generated_sql=result.get("generated_sql"),
+                error=result.get("error") or "unknown",
+                failure_reason="pipeline_failure",
+                database_name=database_name,
+                confidence=result.get("confidence", 0.0),
+            )
+
+    # Fire-and-forget audit write
+    _fire_audit(result, session_id, user_id, query, database_name)
+
+    logger.info(
+        "PRISM complete", sid=session_id,
+        success=result.get("success"), ms=result.get("pipeline_time_ms"),
+        clarification=result.get("needs_clarification", False),
+        pii=bool(result.get("pii_report", {}) and result["pii_report"].get("pii_detected")),
+    )
+    return result
+
+
+def _fire_audit(result: dict, session_id: str, user_id: str, query: str, database_name: str) -> None:
+    """Fire-and-forget audit log write."""
+    try:
+        from core.audit_log import log_query
+        log_query({
+            **result,
+            "nl_query": query,
+            "database_name": database_name,
+            "pii_detected": bool(
+                result.get("pii_report") and result["pii_report"].get("pii_detected")
+            ),
+        }, session_id=session_id, user_id=user_id)
+    except Exception:
+        pass
+
+
+def _error_result(session_id: str, query: str, error: str, start: float) -> dict[str, Any]:
+    return {
+        "success": False, "session_id": session_id, "generated_sql": None,
+        "optimized_sql": None, "answer": None, "columns": [], "rows": [],
+        "row_count": 0, "truncated": False, "confidence": 0.0,
+        "pipeline_stages": [], "execution_time_ms": 0.0,
+        "pipeline_time_ms": round((time.monotonic() - start) * 1000, 2),
+        "error": error, "needs_clarification": False,
+        "clarification_question": None, "clarification_options": [],
+        "cache_hit": False, "pii_report": None, "anomalies": [],
+        "suggestions": [
+            "Check your database connection",
+            "Verify GOOGLE_API_KEY is set correctly",
+            "Ensure the query is a valid question about the database",
+        ],
+    }
+
+
+# ------------------------------------------------------------------ #
+# SSE streaming generator                                              #
+# ------------------------------------------------------------------ #
+
+async def stream_prism_query(
+    query: str,
+    session_id: str | None = None,
+    database_name: str = "default",
+    max_rows: int = 100,
+    execute_query: bool = True,
+    user_id: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Stream PRISM pipeline events as Server-Sent Events (SSE).
+
+    Yields JSON-encoded event strings suitable for text/event-stream responses.
+    Each event: "data: {json}\\n\\n"
+
+    Event types:
+      {"type": "phase", "phase": "schema_discovery", "status": "running"}
+      {"type": "token", "text": "..."}
+      {"type": "sql", "sql": "SELECT ..."}
+      {"type": "result", "data": {...}}   -- final complete result
+      {"type": "error", "error": "..."}
+      {"type": "done"}
+    """
+    settings = get_settings()
+    session_id = session_id or str(uuid.uuid4())
+    user_id = user_id or session_id
+
+    # Check cache first — if hit, return immediately as a single result event
+    if execute_query:
+        try:
+            from core.semantic_cache import get_cached_result
+            cached, source = await get_cached_result(query, database_name)
+            if cached is not None:
+                cached.update({"session_id": session_id, "cache_hit": True, "cache_source": source})
+                yield f"data: {json.dumps({'type': 'result', 'data': cached})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+        except Exception:
+            pass
+
+    message = _build_message(query, database_name, max_rows, execute_query)
+
+    # Stream pipeline phases
+    phase_events = [
+        ("schema_discovery", "Phase P: discovering schema"),
+        ("deep_think", "Phase R: deep think reasoning"),
+        ("sql_generation", "Phase I: generating SQL"),
+        ("validation", "Phase S: validating + optimizing"),
+        ("formatting", "Phase M: formatting response"),
+    ]
+    phase_idx = 0
+
     try:
         runner = _get_runner()
+        full_text = ""
 
-        user_message = _build_user_message(
-            query=query,
-            database_name=database_name,
-            max_rows=max_rows,
-            execute_query=execute_query,
-        )
-
-        response_text = ""
-        with trace_phase("total", {"query": query[:80], "database": database_name}):
-            async for event in runner.run_async(
-                user_id=session_id,
-                session_id=session_id,
-                new_message=genai_types.Content(
-                    role="user",
-                    parts=[genai_types.Part(text=user_message)],
-                ),
-            ):
-                if event.is_final_response() and event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            response_text += part.text
-
-        pipeline_time_ms = (time.monotonic() - pipeline_start) * 1000
-
-        # Parse response
-        result = _parse_agent_response(response_text)
-        result["pipeline_time_ms"] = round(pipeline_time_ms, 2)
-        result["session_id"] = session_id
-        result["cache_hit"] = False
-        result["pipeline_stages"] = [
-            "schema_discovery",
-            "metadata_enrichment",
-            "deep_think_analysis",
-            "schema_linking",
-            "sql_generation",
-            "sql_validation",
-            "query_optimization",
-            "response_formatting",
-        ]
-
-        # Record telemetry
-        if result.get("needs_clarification"):
-            record_query("clarification_needed")
-        elif result["success"]:
-            record_query("success")
-            # Store in cache for future hits
-            if execute_query:
-                try:
-                    from core.semantic_cache import cache_result
-                    await cache_result(query, database_name, result)
-                except Exception as exc:
-                    logger.debug("Cache write failed", error=str(exc))
-        else:
-            record_query("failed")
-
-        logger.info(
-            "PRISM query complete",
+        async for event in runner.run_async(
+            user_id=user_id,
             session_id=session_id,
-            success=result["success"],
-            clarification=result.get("needs_clarification", False),
-            pipeline_time_ms=round(pipeline_time_ms, 2),
-        )
+            new_message=genai_types.Content(
+                role="user",
+                parts=[genai_types.Part(text=message)],
+            ),
+        ):
+            # Emit phase progress events based on agent name
+            agent_name = getattr(event, "author", "") or ""
+            if phase_idx < len(phase_events):
+                phase_key, phase_label = phase_events[phase_idx]
+                if phase_key in agent_name.lower() or (phase_idx == 0 and agent_name):
+                    yield f"data: {json.dumps({'type': 'phase', 'phase': phase_key, 'label': phase_label, 'status': 'running'})}\n\n"
+                    phase_idx += 1
 
-        return result
+            # Stream text tokens
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        full_text += part.text
+                        # Stream tokens for streaming clients
+                        yield f"data: {json.dumps({'type': 'token', 'text': part.text})}\n\n"
 
-    except Exception as e:
-        pipeline_time_ms = (time.monotonic() - pipeline_start) * 1000
-        record_query("failed")
-        logger.error(
-            "PRISM pipeline error",
-            session_id=session_id,
-            error=str(e),
-            pipeline_time_ms=round(pipeline_time_ms, 2),
-        )
-        return {
-            "success": False,
-            "session_id": session_id,
-            "generated_sql": None,
-            "optimized_sql": None,
-            "answer": None,
-            "columns": [],
-            "rows": [],
-            "row_count": 0,
-            "truncated": False,
-            "confidence": 0.0,
-            "pipeline_stages": [],
-            "execution_time_ms": 0.0,
-            "pipeline_time_ms": round(pipeline_time_ms, 2),
-            "error": str(e),
-            "needs_clarification": False,
-            "clarification_question": None,
-            "clarification_options": [],
-            "cache_hit": False,
-            "suggestions": [
-                "Check your database connection",
-                "Verify GOOGLE_API_KEY is set correctly",
-                "Ensure the query is a valid question about the database",
-            ],
-        }
+            # Emit final result
+            if event.is_final_response():
+                result = _parse_response(full_text)
+                result.update({
+                    "session_id": session_id,
+                    "cache_hit": False,
+                    "pipeline_stages": [
+                        "schema_discovery", "metadata_enrichment", "deep_think_analysis",
+                        "schema_linking", "sql_generation", "sql_validation",
+                        "query_optimization", "response_formatting",
+                    ],
+                })
+
+                # Emit SQL as soon as it's available
+                if result.get("generated_sql"):
+                    yield f"data: {json.dumps({'type': 'sql', 'sql': result['generated_sql']})}\n\n"
+
+                yield f"data: {json.dumps({'type': 'result', 'data': result})}\n\n"
+
+                # Background tasks
+                _fire_audit(result, session_id, user_id, query, database_name)
+                if result.get("success") and execute_query:
+                    try:
+                        from core.semantic_cache import cache_result
+                        await cache_result(query, database_name, result)
+                    except Exception:
+                        pass
+
+    except Exception as exc:
+        yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
 
-def _build_user_message(
-    query: str,
-    database_name: str,
-    max_rows: int,
-    execute_query: bool,
-) -> str:
-    """Build the full user message for the orchestrator."""
+def _build_message(query: str, database_name: str, max_rows: int, execute_query: bool) -> str:
     settings = get_settings()
     db_url = settings.database.database_url
     dialect = db_url.split("+")[0].split(":")[0] if ":" in db_url else "sql"
-
-    # Detect Databricks for Spark SQL dialect hint
     if settings.databricks.is_configured:
         dialect = "spark_sql (Databricks)"
 
@@ -404,17 +520,16 @@ def _build_user_message(
 - Deep Think Iterations: {settings.deep_think.deep_think_max_iterations}
 - Confidence Threshold: {settings.deep_think.deep_think_confidence_threshold}
 
-Please run the full PRISM pipeline (P→R→I→S→M) to answer this question:
-1. **Phase P**: Discover the schema (vector search first), check for schema changes
-2. **Phase R**: Apply Deep Think reasoning — request clarification if confidence < {settings.deep_think.deep_think_confidence_threshold}
-3. **Phase I**: Generate accurate, dialect-correct SQL (use semantic memory for similar past queries)
-4. **Phase S**: Validate (syntax/schema/security/performance), estimate cost, optimize
-5. **Phase M**: Execute the SQL and provide a clear answer
+**Instructions:**
+1. Phase P: Discover schema (vector search first), check for schema changes
+2. Phase R: Resolve business terms via glossary FIRST, then Deep Think analysis.
+   Request clarification if confidence < {settings.deep_think.deep_think_confidence_threshold}
+3. Phase I: Generate SQL (check semantic memory for similar past queries first)
+4. Phase S: Validate complexity budget, syntax, schema, security, performance.
+   Estimate cost, check partition coverage.
+5. Phase M: Execute SQL, call interpret_results for PII masking + data story,
+   return structured response.
 
-Return:
-- The final SQL query
-- {"Query execution results" if execute_query else "Only the SQL (do not execute)"}
-- A natural language answer summarizing the key finding
-- Confidence score (0.0-1.0)
-- Any cost warnings if the query scans > {settings.feedback.cost_warn_gb} GB
+Return: SQL, execution results, natural language answer with key finding,
+confidence score, PII report, cost warning (if applicable), anomalies detected.
 """

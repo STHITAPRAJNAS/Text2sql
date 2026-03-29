@@ -69,6 +69,14 @@ class DeepThinkSettings(BaseSettings):
     deep_think_confidence_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     enable_self_reflection: bool = Field(default=True)
     enable_chain_of_thought: bool = Field(default=True)
+    block_advanced_queries: bool = Field(
+        default=False,
+        description="Reject ADVANCED complexity queries (score > 15) before SQL generation.",
+    )
+    max_execution_retries: int = Field(
+        default=2, ge=0, le=5,
+        description="Max auto-retry attempts when SQL execution fails.",
+    )
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

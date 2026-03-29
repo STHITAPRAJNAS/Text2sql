@@ -49,6 +49,8 @@ class QueryResponse(BaseModel):
     cache_hit: bool = False
     cache_source: str | None = None
     cost_warning: str | None = None
+    pii_report: dict[str, Any] | None = None
+    anomalies: list[str] = Field(default_factory=list)
 
 
 # ------------------------------------------------------------------ #
@@ -153,4 +155,83 @@ class CacheStatsResponse(BaseModel):
     l1_ttl_seconds: int = 300
     l2_ttl_seconds: int = 3600
     l2_similarity_threshold: float = 0.92
+
+
+# ------------------------------------------------------------------ #
+# Glossary                                                             #
+# ------------------------------------------------------------------ #
+
+class GlossaryTerm(BaseModel):
+    term: str
+    description: str = ""
+    table_name: str = ""
+    column_name: str = ""
+    filter_sql: str = ""
+    example_sql: str = ""
+    created_at: float | None = None
+    updated_at: float | None = None
+
+
+class GlossaryUpsertRequest(BaseModel):
+    term: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    table_name: str = ""
+    column_name: str = ""
+    filter_sql: str = ""
+    example_sql: str = ""
+
+
+# ------------------------------------------------------------------ #
+# Query History                                                        #
+# ------------------------------------------------------------------ #
+
+class HistoryItem(BaseModel):
+    query_id: str
+    nl_query: str
+    generated_sql: str | None = None
+    success: bool = False
+    confidence: float = 0.0
+    execution_time_ms: float = 0.0
+    pipeline_time_ms: float = 0.0
+    row_count: int = 0
+    cache_hit: bool = False
+    cache_source: str | None = None
+    pii_detected: bool = False
+    cost_warning: str | None = None
+    needs_clarification: bool = False
+    created_at: float = 0.0
+
+
+class HistoryResponse(BaseModel):
+    items: list[HistoryItem]
+    total: int
+    limit: int
+    offset: int
+
+
+# ------------------------------------------------------------------ #
+# Dead Letter Queue                                                    #
+# ------------------------------------------------------------------ #
+
+class DeadLetterItem(BaseModel):
+    id: str
+    query_id: str
+    nl_query: str
+    generated_sql: str | None = None
+    error: str = ""
+    failure_reason: str = ""
+    database_name: str = "default"
+    confidence: float = 0.0
+    reviewed: bool = False
+    corrected_sql: str | None = None
+    created_at: float = 0.0
+
+
+class DeadLetterResponse(BaseModel):
+    items: list[DeadLetterItem]
+    total: int
+
+
+class ResolveDeadLetterRequest(BaseModel):
+    corrected_sql: str = Field(min_length=5)
 
