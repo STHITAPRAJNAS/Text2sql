@@ -65,10 +65,17 @@ async def _add_session_to_memory_callback(callback_context: Any) -> None:
     Called automatically by ADK after the root orchestrator finishes each turn.
     """
     try:
-        from core.memory_store import add_session_to_memory
-        session = getattr(callback_context, "session", None)
-        if session is not None:
-            await add_session_to_memory(session)
+        # Preferred ADK pattern: callback_context.add_session_to_memory()
+        await callback_context.add_session_to_memory()
+    except AttributeError:
+        # Fallback for older ADK versions or non-ADK test contexts
+        try:
+            from core.memory_store import add_session_to_memory
+            session = getattr(callback_context, "session", None)
+            if session is not None:
+                await add_session_to_memory(session)
+        except Exception:
+            pass
     except Exception:
         # Never let memory persistence errors fail the primary response
         pass
