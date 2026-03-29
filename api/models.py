@@ -43,6 +43,12 @@ class QueryResponse(BaseModel):
     pipeline_time_ms: float = 0.0
     error: str | None = None
     suggestions: list[str] = Field(default_factory=list)
+    needs_clarification: bool = False
+    clarification_question: str | None = None
+    clarification_options: list[str] = Field(default_factory=list)
+    cache_hit: bool = False
+    cache_source: str | None = None
+    cost_warning: str | None = None
 
 
 # ------------------------------------------------------------------ #
@@ -115,3 +121,36 @@ class ExampleResponse(BaseModel):
     example_id: str | None = None
     total_examples: int = 0
     error: str | None = None
+
+# ------------------------------------------------------------------ #
+# Feedback                                                             #
+# ------------------------------------------------------------------ #
+
+class FeedbackRequest(BaseModel):
+    query: str = Field(min_length=3)
+    sql: str = Field(min_length=5)
+    rating: float = Field(ge=1.0, le=5.0, description="Rating from 1 (bad) to 5 (excellent)")
+    database_name: str = "default"
+    session_id: str | None = None
+    comment: str | None = None
+    corrected_sql: str | None = None
+
+
+class FeedbackResponse(BaseModel):
+    feedback_id: str
+    actions_taken: list[str] = Field(default_factory=list)
+    status: str = "recorded"
+
+
+# ------------------------------------------------------------------ #
+# Cache                                                                #
+# ------------------------------------------------------------------ #
+
+class CacheStatsResponse(BaseModel):
+    l1_backend: str = "redis"
+    l2_backend: str = "chromadb"
+    l2_size: int = 0
+    l1_ttl_seconds: int = 300
+    l2_ttl_seconds: int = 3600
+    l2_similarity_threshold: float = 0.92
+

@@ -7,6 +7,8 @@ For large databases (Databricks Unity Catalog with thousands of tables):
     to find the 10–15 most relevant tables for the user's query.
   - It then calls index_table_if_new for any tables it encounters that
     aren't yet in the index, so they're available for future queries.
+  - For previously indexed tables, it checks for schema changes via
+    Delta DESCRIBE HISTORY and refreshes stale entries automatically.
   - Full table details are fetched ONLY for the relevant subset.
 
 This design means the schema context passed to Phase R is always focused
@@ -35,19 +37,81 @@ from agents.tools.indexing_tools import (
 )
 
 
+def _make_check_schema_change_tool():
+    """
+    Create a schema-change-check tool as a plain function.
+    Wraps the async check in a sync ADK-compatible tool.
+    """
+    def check_table_for_changes(table_id: str) -> dict:
+        """
+        Check if a table has changed since it was last indexed.
+        If changed, automatically refreshes the index entry.
+
+        Use this after retrieving a table from the index to ensure
+        the schema metadata is up-to-date.
+
+        Args:
+            table_id: Full table reference e.g. "main.sales.orders"
+
+        Returns:
+            {"changed": bool, "refreshed": bool, "table_id": table_id}
+        """
+        import asyncio
+        from core.schema_change_detector import check_and_refresh_if_changed
+        try:
+            # Run the async function in the current event loop if available
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Schedule as a task and get result
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        future = pool.submit(
+                            asyncio.run, check_and_refresh_if_changed(table_id)
+                        )
+                        refreshed = future.result(timeout=10)
+                else:
+                    refreshed = loop.run_until_complete(
+                        check_and_refresh_if_changed(table_id)
+                    )
+            except RuntimeError:
+                refreshed = asyncio.run(check_and_refresh_if_changed(table_id))
+
+            return {
+                "table_id": table_id,
+                "changed": refreshed,
+                "refreshed": refreshed,
+                "status": "refreshed" if refreshed else "up_to_date",
+            }
+        except Exception as exc:
+            return {
+                "table_id": table_id,
+                "changed": False,
+                "refreshed": False,
+                "status": f"check_failed: {exc}",
+            }
+
+    return check_table_for_changes
+
+
+# Create the tool once at module load time
+check_table_for_changes = _make_check_schema_change_tool()
+
+
 def create_schema_discovery_agent() -> Agent:
     """
     Create the Schema Discovery Agent.
 
     Tool priority for large databases:
-      1. search_relevant_tables  → semantic vector search (fast, always first)
-      2. index_table_if_new      → auto-index tables not yet in the store
-      3. get_indexed_table       → retrieve cached column-level details
-      4. get_table_details       → direct DB fetch (when not indexed)
-      5. find_related_tables     → discover join paths
-      6. get_sample_values       → understand filter column values
-      7. search_schema_by_keyword → keyword fallback search
-      8. bulk_index_schema       → bootstrap a new catalog/schema
+      1. search_relevant_tables    → semantic vector search (fast, always first)
+      2. index_table_if_new        → auto-index tables not yet in the store
+      3. check_table_for_changes   → detect Delta table schema changes, auto-refresh
+      4. get_indexed_table         → retrieve cached column-level details
+      5. get_table_details         → direct DB fetch (when not indexed)
+      6. find_related_tables       → discover join paths
+      7. get_sample_values         → understand filter column values
+      8. search_schema_by_keyword  → keyword fallback search
+      9. bulk_index_schema         → bootstrap a new catalog/schema
     """
     settings = get_settings()
 
@@ -57,13 +121,15 @@ def create_schema_discovery_agent() -> Agent:
         description=(
             "Database schema expert. For large databases (Unity Catalog), uses semantic "
             "vector search to find relevant tables among thousands, auto-indexes newly "
-            "encountered tables, and builds focused schema context for SQL generation."
+            "encountered tables, detects schema changes via Delta DESCRIBE HISTORY, "
+            "and builds focused schema context for SQL generation."
         ),
         instruction=PromptLibrary.SCHEMA_DISCOVERY_AGENT,
         tools=[
             # Vector index tools (primary for large databases)
             search_relevant_tables,
             index_table_if_new,
+            check_table_for_changes,
             get_indexed_table,
             list_indexed_tables,
             bulk_index_schema,
@@ -99,6 +165,7 @@ def create_metadata_enrichment_agent() -> Agent:
         tools=[
             search_relevant_tables,
             get_indexed_table,
+            check_table_for_changes,
             search_schema_by_keyword,
             get_database_schema,
         ],

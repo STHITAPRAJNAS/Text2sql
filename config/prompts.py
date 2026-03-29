@@ -29,13 +29,18 @@ use the vector index tools to avoid context overflow.
    isn't yet detailed, call this to fetch and index full column metadata.
    This is idempotent and cached — subsequent calls are instant.
 
-3. **get_indexed_table(table_id)** — Retrieve full column-level detail for
+3. **check_table_for_changes(table_id)** — For previously indexed tables, call
+   this to detect Delta table schema changes via DESCRIBE HISTORY. It automatically
+   refreshes the index entry if the table was modified after last indexing.
+   Call this for the top 5 most relevant tables.
+
+4. **get_indexed_table(table_id)** — Retrieve full column-level detail for
    indexed tables (faster than fetching from DB).
 
-4. **find_related_tables(table_name)** — Discover JOIN paths between tables.
+5. **find_related_tables(table_name)** — Discover JOIN paths between tables.
    Auto-index any related tables you find.
 
-5. **get_sample_values(table, column)** — For filter columns (status, category,
+6. **get_sample_values(table, column)** — For filter columns (status, category,
    type), fetch sample values to understand the actual data.
 
 ### Small databases (< 50 tables):
@@ -131,8 +136,40 @@ Rate your analysis confidence 0.0-1.0 based on:
 - Query complexity
 - Ambiguities remaining
 
+## Clarification Protocol
+
+**MANDATORY**: If after completing all 6 steps your confidence score is below the
+configured threshold (default 0.85), you MUST call `request_clarification` instead
+of proceeding to SQL generation.
+
+When to request clarification:
+- Multiple tables plausibly answer the question and the choice materially affects results
+- A required filter value is missing ("show sales" — which period? which region?)
+- A business term is undefined ("active customers" — what defines active?)
+- The query has 2+ equally valid interpretations with different SQL shapes
+- Confidence score < 0.75 after all ambiguity resolution attempts
+
+How to call it:
+```
+request_clarification(
+    question="Which time period should the revenue calculation cover?",
+    options=["This month", "This quarter", "This year", "All time"],
+    ambiguities=["No date filter specified", "revenue column could be order_amount or net_revenue"],
+    confidence=0.55,
+)
+```
+
+If confidence ≥ threshold and all ambiguities are resolved: proceed normally.
+
+## Multi-turn Context
+If the user's question references previous results ("those customers", "that query",
+"change it to..."), look at the session history to understand the reference context.
+Always resolve pronouns and references before proceeding.
+
 ## Output
-Produce a structured QueryAnalysis JSON with all above fields. This is consumed by the SQL Generator."""
+Produce a structured QueryAnalysis JSON with all above fields.
+If clarification was requested, set status="clarification_needed".
+This is consumed by the SQL Generator."""
 
     # ------------------------------------------------------------------ #
     # Entity & Schema Linker Agent                                          #
@@ -183,16 +220,75 @@ You generate production-quality, optimized SQL from structured query analysis.
 - Apply proper GROUP BY (include all non-aggregated SELECT columns)
 - Use HAVING for post-aggregation filters, WHERE for pre-aggregation
 
+### Semantic Memory — ALWAYS check first
+Before generating SQL:
+1. Call `load_memory` (if available) with the user's question to retrieve similar
+   past queries from previous sessions. Use these as the highest-priority few-shot
+   context — they are real production examples from this exact catalog.
+2. Call `get_memory_context` for in-session examples from the current conversation.
+3. Call `get_similar_examples` for curated few-shot examples.
+
+Pattern from memory takes precedence over generic examples.
+
 ### Dialect Awareness
 Adjust syntax for the target database:
-- **PostgreSQL**: Use `DATE_TRUNC`, `EXTRACT`, `::` casting, `ILIKE`
-- **MySQL**: Use `DATE_FORMAT`, `YEAR()`, `MONTH()`, `CAST(... AS ...)`
-- **BigQuery**: Use `DATE_TRUNC`, `FORMAT_DATE`, backtick identifiers
-- **Snowflake**: Use `DATE_TRUNC`, `TO_DATE`, double-quote identifiers
-- **SQLite**: Use `strftime`, `DATE()`, no schema prefix
+- **PostgreSQL**: `DATE_TRUNC`, `EXTRACT`, `::` casting, `ILIKE`, `UNNEST`
+- **MySQL**: `DATE_FORMAT`, `YEAR()`, `MONTH()`, `CAST(... AS ...)`
+- **BigQuery**: `DATE_TRUNC`, `FORMAT_DATE`, backtick identifiers
+- **Snowflake**: `DATE_TRUNC`, `TO_DATE`, double-quote identifiers
+- **SQLite**: `strftime`, `DATE()`, no schema prefix
+
+### Spark SQL / Databricks Dialect (when dialect = spark_sql)
+Use these Databricks/Spark-specific constructs when appropriate:
+
+**Filtering & Matching**
+- `ILIKE` for case-insensitive LIKE: `WHERE name ILIKE '%john%'`
+- `RLIKE` for regex matching: `WHERE email RLIKE '^[a-z]+'`
+- `TRY_CAST(expr AS type)` — returns NULL instead of error on bad cast
+- `TRY_DIVIDE(numerator, denominator)` — returns NULL on divide-by-zero
+
+**Window Functions**
+- Named window: `WINDOW w AS (PARTITION BY x ORDER BY y)`
+  → `ROW_NUMBER() OVER w`
+- `QUALIFY ROW_NUMBER() OVER (PARTITION BY x ORDER BY y DESC) = 1`
+  — filter on window function result without subquery
+
+**Aggregation & Analytics**
+- `APPROX_COUNT_DISTINCT(col)` — fast approximate distinct count for large tables
+- `PERCENTILE_APPROX(col, 0.5)` — approximate median
+- `COLLECT_LIST(col)` / `COLLECT_SET(col)` — aggregate into array/set
+- `EXPLODE(array_col)` — unnest arrays inline
+- Higher-order: `TRANSFORM(array_col, x -> x * 2)`,
+  `FILTER(array_col, x -> x > 0)`,
+  `AGGREGATE(array_col, 0L, (acc, x) -> acc + x)`
+
+**Pivoting**
+- `PIVOT`: `SELECT * FROM t PIVOT (SUM(val) FOR month IN ('Jan','Feb','Mar'))`
+
+**STRUCT and Complex Types**
+- Access struct fields: `event.properties.user_id`
+- `VARIANT` type (Databricks 12.2+): `event:properties:user_id`
+
+**Cross-catalog JOINs**
+- Always use fully-qualified 3-part names: `` `catalog`.`schema`.`table` ``
+- Example: `` FROM `main`.`sales`.`orders` o JOIN `audit`.`logs`.`events` e ON ... ``
+
+**Date/Time**
+- `DATE_TRUNC('month', ts)` — truncate to month
+- `DATEADD(MONTH, -1, current_date())` — subtract 1 month
+- `DATEDIFF(end_date, start_date)` — days between dates
+- `CURRENT_TIMESTAMP()` — current datetime
+
+**Performance Hints**
+- `/*+ BROADCAST(small_table) */` after SELECT for broadcast join
+- `/*+ REPARTITION(10, key) */` for explicit repartitioning
 
 ### Few-Shot Examples
 When similar examples are provided, follow their pattern for consistency.
+
+### Self-Improvement
+After generating SQL with confidence ≥ threshold, call `store_successful_query`
+to persist this query→SQL pair for future sessions.
 
 ### Anti-patterns to Avoid
 - Never use `SELECT *` in production queries
@@ -291,11 +387,25 @@ Use `get_query_explain` to identify:
 - Nested loop joins on large datasets (suggest hash join hint)
 - Sort operations without index (suggest ORDER BY optimization)
 
+## Cost Estimation (Databricks/Spark SQL)
+Call `estimate_query_cost(sql)` to get the estimated bytes scanned:
+- If > cost_warn_gb (default 10 GB): add a cost_warning field to your output
+- Call `check_partition_coverage(sql, table_id)` to check if partition filters are present
+- If no partition filter on a partitioned table: suggest adding one in the optimization
+
+## Spark SQL Optimizations
+- Add `/*+ BROADCAST(t) */` hint when joining small lookup tables (< 100MB)
+- Use `APPROX_COUNT_DISTINCT` instead of `COUNT(DISTINCT ...)` for large tables
+- Replace `IN (SELECT ...)` with `LEFT SEMI JOIN` for Spark optimization
+- Push filters before GROUP BY: `WHERE` instead of `HAVING` when possible
+- For Z-ORDER queries: note if Z-ORDER on commonly filtered columns would help
+
 ## Output
 - `optimized_sql`: The performance-optimized SQL
 - `optimizations_applied`: List of applied optimizations
 - `estimated_improvement`: Expected performance gain
-- `index_suggestions`: Suggested indexes for schema team (if needed)"""
+- `cost_warning`: Estimated bytes scanned warning (if applicable)
+- `index_suggestions`: Suggested indexes/Z-ORDER for schema team (if needed)"""
 
     # ------------------------------------------------------------------ #
     # Response Formatter Agent                                              #
@@ -357,25 +467,48 @@ optimized SQL queries and meaningful results.
 
 ### Phase P: Pre-processing & Schema Discovery (Parallel)
 Simultaneously run:
-- Schema Discovery Agent (database structure)
+- Schema Discovery Agent (database structure + schema change detection)
 - Metadata Enrichment Agent (business context)
 
 ### Phase R: Reasoning — Deep Think Analysis (Sequential)
 Run the Deep Think pipeline:
 1. Query Analyzer (chain-of-thought decomposition)
+   - If confidence < threshold: STOPS pipeline, returns clarification request
 2. Schema Linker (entity-to-schema mapping)
 
 ### Phase I: Intent Mapping & SQL Generation
-Generate SQL from the structured analysis
+Generate SQL from the structured analysis:
+- SQL Generator first checks semantic memory (LoadMemoryTool) for similar past queries
+- High-confidence results stored back to memory for self-improvement
 
-### Phase S: SQL Synthesis — Validation & Optimization Loop
+### Phase S: SQL Synthesis — Validation & Cost-Aware Optimization Loop
 Iteratively:
-1. Validate SQL (syntax, schema, security)
-2. Optimize for performance
+1. Validate SQL (syntax, schema, security, performance)
+2. Estimate query cost and check partition coverage
+3. Optimize for performance (Spark hints, predicate pushdown, BROADCAST)
 Maximum iterations: configured via DEEP_THINK_MAX_ITERATIONS
 
 ### Phase M: Monitoring & Response
 Execute and format the final response
+
+## Special Handling
+
+### Clarification Flow
+If the Deep Think analyzer calls request_clarification:
+- The pipeline exits immediately with needs_clarification=true
+- Return the clarification question and options to the caller
+- The client re-submits with the user's answer as additional context
+
+### Cache Hits
+If the semantic cache returned a hit (cache_hit=true):
+- Skip the PRISM pipeline entirely — return the cached result
+- The runner handles this before reaching the orchestrator
+
+### Multi-turn Conversations
+For follow-up questions in the same session:
+- Previous query context is preserved in session state
+- Agents can reference prior SQL via session state (successful_queries)
+- "Change it to..." or "also show..." queries use the previous SQL as base
 
 ## Decision Making
 - If confidence < threshold: Trigger re-analysis with broader context

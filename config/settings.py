@@ -124,6 +124,101 @@ class VectorIndexSettings(BaseSettings):
     )
 
 
+class SessionSettings(BaseSettings):
+    """ADK DatabaseSessionService configuration (4 tables: sessions, events, app/user state)."""
+
+    session_db_url: str = Field(
+        default="sqlite+aiosqlite:///./data/sessions.db",
+        description="SQLAlchemy async URL for ADK session persistence. "
+                    "Use postgresql+asyncpg://... for production.",
+    )
+    # When set, overrides session_db_url for get_fast_api_app
+    session_service_uri: str = Field(
+        default="",
+        description="If non-empty, passed directly to get_fast_api_app as session_service_uri. "
+                    "Overrides session_db_url. Use 'sqlite+aiosqlite:///./data/sessions.db' etc.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="SESSION_",
+        extra="ignore",
+    )
+
+
+class MemorySettings(BaseSettings):
+    """ADK MemoryService configuration — semantic vector store for agent self-improvement."""
+
+    backend: str = Field(
+        default="in_memory",
+        description="Memory backend: in_memory | vertex_ai. "
+                    "vertex_ai requires MEMORY_AGENT_ENGINE_ID to be set.",
+    )
+    agent_engine_id: str = Field(
+        default="",
+        description="Vertex AI Agent Engine ID for VertexAiMemoryBankService.",
+    )
+    # Controls how many past sessions the memory tools return
+    memory_top_k: int = Field(default=5, ge=1, le=20)
+    # Minimum confidence for memory-retrieved examples to be used
+    memory_confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="MEMORY_",
+        extra="ignore",
+    )
+
+
+class SemanticCacheSettings(BaseSettings):
+    """Two-tier semantic query result cache: Redis (L1 exact) + ChromaDB (L2 semantic)."""
+
+    enable_l1_cache: bool = Field(default=True, description="Redis exact-match cache")
+    enable_l2_cache: bool = Field(default=True, description="ChromaDB semantic similarity cache")
+    l1_ttl_seconds: int = Field(default=300, description="Redis TTL in seconds (5 minutes)")
+    l2_ttl_seconds: int = Field(default=3600, description="ChromaDB result TTL in seconds (1 hour)")
+    l2_similarity_threshold: float = Field(
+        default=0.92,
+        ge=0.0, le=1.0,
+        description="Min cosine similarity to use L2 cache hit",
+    )
+    chroma_persist_dir: str = Field(default="./data/chroma/semantic_cache")
+    max_cached_results: int = Field(default=10000, description="Max cached query results")
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="SEMANTIC_CACHE_",
+        extra="ignore",
+    )
+
+
+class FeedbackSettings(BaseSettings):
+    """Feedback loop + active learning configuration."""
+
+    auto_add_to_fewshot: bool = Field(
+        default=True,
+        description="Automatically add highly-rated queries to the few-shot store.",
+    )
+    auto_add_to_memory: bool = Field(
+        default=True,
+        description="Automatically add highly-rated queries to the ADK memory service.",
+    )
+    min_rating_for_fewshot: float = Field(
+        default=4.0, ge=1.0, le=5.0,
+        description="Minimum rating (1-5) to add to few-shot store.",
+    )
+    cost_warn_gb: float = Field(
+        default=10.0,
+        description="Warn if query scans more than this many GB.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="FEEDBACK_",
+        extra="ignore",
+    )
+
+
 class APISettings(BaseSettings):
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8080, ge=1, le=65535)
@@ -172,6 +267,10 @@ class Settings(BaseSettings):
     cache: CacheSettings = Field(default_factory=CacheSettings)
     vector_store: VectorStoreSettings = Field(default_factory=VectorStoreSettings)
     vector_index: VectorIndexSettings = Field(default_factory=VectorIndexSettings)
+    session: SessionSettings = Field(default_factory=SessionSettings)
+    memory: MemorySettings = Field(default_factory=MemorySettings)
+    semantic_cache: SemanticCacheSettings = Field(default_factory=SemanticCacheSettings)
+    feedback: FeedbackSettings = Field(default_factory=FeedbackSettings)
     api: APISettings = Field(default_factory=APISettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 

@@ -5,7 +5,7 @@ Phase R of the PRISM pipeline — the reasoning core using chain-of-thought.
 The Deep Think approach:
 1. Decompose the query into atomic components
 2. Extract business entities with NER-like analysis
-3. Assess ambiguities and make documented assumptions
+3. Assess ambiguities and request clarification when needed
 4. Score confidence and flag complex cases
 5. Produce a structured QueryAnalysis for downstream agents
 """
@@ -21,6 +21,8 @@ from agents.tools.schema_tools import (
     find_related_tables,
     get_sample_values,
 )
+from agents.tools.clarification_tools import request_clarification
+from agents.tools.indexing_tools import search_relevant_tables
 
 
 def create_deep_think_query_analyzer() -> Agent:
@@ -34,10 +36,13 @@ def create_deep_think_query_analyzer() -> Agent:
     Deep Think Process:
     1. Query decomposition
     2. Entity extraction
-    3. Ambiguity resolution
+    3. Ambiguity resolution — calls request_clarification if unresolvable
     4. Complexity assessment
     5. Mental execution plan
     6. Confidence scoring
+
+    If confidence < deep_think_confidence_threshold, the agent MUST call
+    request_clarification before proceeding.
 
     Uses the most capable model (Pro) for maximum reasoning depth.
     """
@@ -48,13 +53,15 @@ def create_deep_think_query_analyzer() -> Agent:
         model=settings.llm.query_analyzer_model,
         description=(
             "Deep Think reasoning agent that uses chain-of-thought analysis to deeply understand "
-            "natural language queries, extract entities, resolve ambiguities, and produce a "
-            "structured analysis for SQL generation."
+            "natural language queries, extract entities, resolve ambiguities, and either produce a "
+            "structured analysis for SQL generation or request clarification for ambiguous queries."
         ),
         instruction=PromptLibrary.DEEP_THINK_QUERY_ANALYZER,
         tools=[
+            search_relevant_tables,
             search_schema_by_keyword,
             get_table_details,
+            request_clarification,
         ],
     )
 
@@ -83,6 +90,7 @@ def create_schema_linker_agent() -> Agent:
         ),
         instruction=PromptLibrary.SCHEMA_LINKER_AGENT,
         tools=[
+            search_relevant_tables,
             search_schema_by_keyword,
             get_table_details,
             find_related_tables,

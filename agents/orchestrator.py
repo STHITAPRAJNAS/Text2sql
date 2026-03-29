@@ -9,25 +9,32 @@ Architecture:
   │                     PRISM ORCHESTRATOR                              │
   │                                                                     │
   │  Phase P: Pre-processing (ParallelAgent)                            │
-  │    ├── Schema Discovery Agent  ──→ DB schema + relationships        │
+  │    ├── Schema Discovery Agent  ──→ DB schema + change detection     │
   │    └── Metadata Enrichment Agent ─→ Business context + glossary    │
   │                                                                     │
   │  Phase R: Reasoning (SequentialAgent - Deep Think)                  │
-  │    ├── Deep Think Query Analyzer ─→ CoT query decomposition         │
+  │    ├── Deep Think Query Analyzer ─→ CoT decomposition               │
+  │    │                                 OR request_clarification       │
   │    └── Schema Linker Agent ───────→ Entity-to-schema mapping        │
   │                                                                     │
-  │  Phase I: Intent → SQL (Agent)                                      │
+  │  Phase I: Intent → SQL (Agent + LoadMemoryTool)                     │
   │    └── SQL Generator Agent ───────→ Dialect-aware SQL               │
   │                                                                     │
   │  Phase S: Synthesis / Validation Loop (LoopAgent, max 3 iter)      │
   │    ├── SQL Validator Agent ───────→ Multi-layer validation          │
-  │    └── Query Optimizer Agent ─────→ Performance optimization        │
+  │    └── Query Optimizer Agent ─────→ Cost-aware optimization         │
   │                                                                     │
   │  Phase M: Monitoring / Response (Agent)                             │
   │    └── Response Formatter Agent ──→ Execute + NL answer             │
   └─────────────────────────────────────────────────────────────────────┘
+
+After-agent callback:
+  after_agent_callback calls add_session_to_memory to persist the full
+  reasoning trace for future self-improvement via LoadMemoryTool.
 """
 from __future__ import annotations
+
+from typing import Any
 
 from google.adk.agents import Agent, LlmAgent, ParallelAgent, SequentialAgent, LoopAgent
 
@@ -45,6 +52,26 @@ from agents.swarm.sql_generator import create_sql_generator_agent
 from agents.swarm.sql_validator import create_sql_validator_agent
 from agents.swarm.query_optimizer import create_query_optimizer_agent
 from agents.swarm.response_formatter import create_response_formatter_agent
+
+
+async def _add_session_to_memory_callback(callback_context: Any) -> None:
+    """
+    After-agent callback: persist the completed session to the ADK MemoryService.
+
+    This enables self-improvement — the LoadMemoryTool in the SQL Generator
+    retrieves semantically similar past sessions as dynamic few-shot context,
+    growing richer with every production query.
+
+    Called automatically by ADK after the root orchestrator finishes each turn.
+    """
+    try:
+        from core.memory_store import add_session_to_memory
+        session = getattr(callback_context, "session", None)
+        if session is not None:
+            await add_session_to_memory(session)
+    except Exception:
+        # Never let memory persistence errors fail the primary response
+        pass
 
 
 def create_prism_orchestrator() -> Agent:
@@ -70,7 +97,8 @@ def create_prism_orchestrator() -> Agent:
         name="phase_p_preprocessing",
         description=(
             "Phase P: Simultaneously discovers database schema and enriches it with "
-            "business metadata. Both agents run in parallel to minimize latency."
+            "business metadata. Schema agent auto-detects Delta table changes. "
+            "Both agents run in parallel to minimize latency."
         ),
         sub_agents=[
             create_schema_discovery_agent(),
@@ -85,7 +113,8 @@ def create_prism_orchestrator() -> Agent:
         name="phase_r_deep_think_reasoning",
         description=(
             "Phase R: Deep Think sequential reasoning pipeline. "
-            "First decomposes the query with chain-of-thought analysis, "
+            "First decomposes the query with chain-of-thought analysis "
+            "(calls request_clarification if confidence < threshold), "
             "then precisely links entities to schema elements."
         ),
         sub_agents=[
@@ -102,15 +131,16 @@ def create_prism_orchestrator() -> Agent:
     # ------------------------------------------------------------------ #
     # Phase S: Synthesis — Validation + Optimization Loop                 #
     # The LoopAgent iterates up to max_iterations times.                   #
-    # The loop exits when the validator returns is_valid=True              #
-    # or max iterations are reached.                                       #
+    # The loop exits when the validator calls exit_validation_loop or      #
+    # the query analyzer calls request_clarification (escalate=True).     #
     # ------------------------------------------------------------------ #
     phase_s_validation_loop = LoopAgent(
         name="phase_s_validation_optimization_loop",
         description=(
-            "Phase S: Iterative SQL validation and optimization loop. "
-            "Validates the generated SQL across 4 layers (syntax, schema, security, performance), "
-            "then optimizes for maximum performance. Repeats up to max_iterations times."
+            "Phase S: Iterative SQL validation and cost-aware optimization loop. "
+            "Validates across 4 layers (syntax, schema, security, performance), "
+            "estimates scan cost and partition coverage, then optimizes. "
+            "Repeats up to max_iterations times."
         ),
         sub_agents=[
             create_sql_validator_agent(),
@@ -141,8 +171,8 @@ def create_prism_orchestrator() -> Agent:
 
     # ------------------------------------------------------------------ #
     # Root Orchestrator Agent                                              #
-    # The root agent is what gets called by the Runner.                   #
-    # It coordinates the pipeline and handles top-level decisions.        #
+    # after_agent_callback persists session to ADK MemoryService for      #
+    # cross-session self-improvement via LoadMemoryTool.                  #
     # ------------------------------------------------------------------ #
     orchestrator = Agent(
         name="prism_text2sql_orchestrator",
@@ -150,10 +180,11 @@ def create_prism_orchestrator() -> Agent:
         description=(
             "PRISM Text2SQL Orchestrator — Enterprise-grade natural language to SQL agent. "
             "Converts natural language questions into accurate, optimized SQL queries using "
-            "a 5-phase multi-agent swarm with Deep Think reasoning."
+            "a 5-phase multi-agent swarm with Deep Think reasoning and self-improvement."
         ),
         instruction=PromptLibrary.ORCHESTRATOR_AGENT,
         sub_agents=[prism_pipeline],
+        after_agent_callback=_add_session_to_memory_callback,
     )
 
     return orchestrator

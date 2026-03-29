@@ -8,14 +8,16 @@ Uses Google ADK's get_fast_api_app() as the base, which provides:
   - DELETE /apps/{app_name}/users/{user_id}/sessions/{session_id}
   - POST /run / POST /run_sse   (convenience shorthand)
 
-We mount custom enterprise endpoints ON TOP of the ADK app:
+Custom enterprise endpoints:
   - POST /api/v1/query          ← high-level NL→SQL convenience wrapper
   - GET  /api/v1/schema         ← schema discovery
   - GET  /api/v1/schema/index   ← what's in the vector index
   - POST /api/v1/schema/index   ← trigger bulk indexing of a schema
   - POST /api/v1/examples       ← add few-shot examples
+  - POST /api/v1/feedback       ← user ratings + active learning
+  - DELETE /api/v1/cache        ← flush semantic cache
   - GET  /api/v1/health         ← health check
-  - GET  /api/v1/metrics        ← agent status
+  - GET  /api/v1/metrics        ← telemetry + cache + feedback stats
 
 ADK app_name = "text2sql_prism"
 Loaded from: agents/text2sql_prism/agent.py  (exports root_agent)
@@ -36,8 +38,11 @@ from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 
 from api.models import (
+    CacheStatsResponse,
     ExampleRequest,
     ExampleResponse,
+    FeedbackRequest,
+    FeedbackResponse,
     HealthResponse,
     IndexRequest,
     IndexResponse,
@@ -58,27 +63,36 @@ def _build_adk_app() -> FastAPI:
     """
     Create the base FastAPI app using Google ADK's get_fast_api_app().
 
-    Falls back to a plain FastAPI instance if google-adk is not installed,
-    so the app still starts cleanly in development / test environments.
+    Passes session_service_uri (DatabaseSessionService) and memory_service_uri
+    (VertexAiMemoryBankService or None for in-memory) so the ADK Dev UI and
+    /run endpoint both use persistent storage.
+
+    Falls back to a plain FastAPI instance if google-adk is not installed.
     """
     settings = get_settings()
 
     try:
         from google.adk.cli.fast_api import get_fast_api_app
+        from core.session_store import get_session_service_uri
+        from core.memory_store import get_memory_service_uri
+
+        session_uri = get_session_service_uri()
+        memory_uri = get_memory_service_uri()
 
         app = get_fast_api_app(
             agents_dir=str(AGENTS_DIR),
-            # None = InMemorySessionService (swap for Redis URI in production)
-            session_service_uri=None,
+            session_service_uri=session_uri,
             artifact_service_uri=None,
-            memory_service_uri=None,
+            memory_service_uri=memory_uri,
             allow_origins=settings.api.allowed_origins,
-            web=False,   # True enables the ADK Dev UI (useful in local dev)
+            web=False,
         )
         logger.info(
             "ADK get_fast_api_app loaded",
             agents_dir=str(AGENTS_DIR),
             app_name="text2sql_prism",
+            session_backend="database" if session_uri else "in_memory",
+            memory_backend=settings.memory.backend,
         )
         return app
 
@@ -107,7 +121,7 @@ def create_app() -> FastAPI:
     app = _build_adk_app()
 
     # ------------------------------------------------------------------ #
-    # Middleware (added after get_fast_api_app so they apply to all routes)
+    # Middleware                                                           #
     # ------------------------------------------------------------------ #
     app.add_middleware(
         CORSMiddleware,
@@ -130,9 +144,7 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ #
     # Optional API key security                                           #
     # ------------------------------------------------------------------ #
-    api_key_header = APIKeyHeader(
-        name=settings.api.api_key_header, auto_error=False
-    )
+    api_key_header = APIKeyHeader(name=settings.api.api_key_header, auto_error=False)
 
     async def get_api_key(key: str = Security(api_key_header)) -> str | None:
         return key
@@ -163,7 +175,6 @@ def create_app() -> FastAPI:
         """Database connectivity and agent readiness check."""
         db_ok = False
         try:
-            # Try Databricks first
             from core.databricks import get_databricks_connector
             conn = get_databricks_connector()
             if conn:
@@ -197,12 +208,12 @@ def create_app() -> FastAPI:
         "/api/v1/query",
         response_model=QueryResponse,
         tags=["Text2SQL"],
-        summary="Natural language → SQL (convenience wrapper)",
+        summary="Natural language → SQL",
         description=(
-            "High-level endpoint that runs the full PRISM pipeline and returns "
-            "structured results. Internally uses the ADK runner via "
-            "agents/runner.py. For streaming or session-aware usage, use the "
-            "native ADK endpoint: POST /apps/text2sql_prism/users/{uid}/sessions/{sid}/runs"
+            "Runs the full PRISM pipeline with semantic cache (L1+L2). "
+            "Returns clarification request when query is ambiguous. "
+            "For streaming, use the ADK endpoint: "
+            "POST /apps/text2sql_prism/users/{uid}/sessions/{sid}/runs"
         ),
     )
     async def query_to_sql(
@@ -243,10 +254,46 @@ def create_app() -> FastAPI:
                 pipeline_time_ms=pipeline_ms,
                 error=result.get("error"),
                 suggestions=result.get("suggestions", []),
+                needs_clarification=result.get("needs_clarification", False),
+                clarification_question=result.get("clarification_question"),
+                clarification_options=result.get("clarification_options", []),
+                cache_hit=result.get("cache_hit", False),
+                cache_source=result.get("cache_source"),
+                cost_warning=result.get("cost_warning"),
             )
         except Exception as e:
             logger.error("Pipeline error", error=str(e), session_id=session_id)
             raise HTTPException(status_code=500, detail=str(e))
+
+    # ---- Feedback ------------------------------------------------------
+
+    @app.post(
+        "/api/v1/feedback",
+        response_model=FeedbackResponse,
+        tags=["Feedback"],
+        summary="Submit feedback on a generated SQL query",
+        description=(
+            "Record user rating (1-5) on generated SQL. "
+            "Ratings ≥ 4 automatically add the query to the few-shot store "
+            "and ADK memory service for self-improvement. "
+            "Corrections (corrected_sql) are immediately added as high-value examples."
+        ),
+    )
+    async def submit_feedback(
+        request: FeedbackRequest,
+        api_key: str | None = Depends(get_api_key),
+    ) -> FeedbackResponse:
+        from agents.tools.feedback_tools import record_feedback
+        result = record_feedback(
+            query=request.query,
+            sql=request.sql,
+            rating=request.rating,
+            database_name=request.database_name,
+            session_id=request.session_id,
+            comment=request.comment,
+            corrected_sql=request.corrected_sql,
+        )
+        return FeedbackResponse(**result)
 
     # ---- Schema discovery ----------------------------------------------
 
@@ -262,10 +309,7 @@ def create_app() -> FastAPI:
         schema: str | None = None,
         api_key: str | None = Depends(get_api_key),
     ) -> SchemaResponse:
-        """
-        Retrieve schema. For Databricks, pass catalog + schema to scope results.
-        For SQLAlchemy databases, uses the configured DATABASE_URL.
-        """
+        """For Databricks, pass catalog + schema to scope results."""
         from core.databricks import get_databricks_connector
         conn = get_databricks_connector()
 
@@ -274,9 +318,7 @@ def create_app() -> FastAPI:
             return SchemaResponse(
                 database_name=f"{catalog}.{schema}",
                 dialect="databricks_spark_sql",
-                tables={
-                    t["full_name"]: t for t in tables
-                },
+                tables={t["full_name"]: t for t in tables},
                 relationships=[],
                 total_tables=len(tables),
             )
@@ -304,7 +346,6 @@ def create_app() -> FastAPI:
         limit: int = 50,
         api_key: str | None = Depends(get_api_key),
     ) -> SchemaIndexListResponse:
-        """List tables currently in the schema vector index."""
         from agents.tools.indexing_tools import list_indexed_tables
         result = list_indexed_tables(catalog=catalog, limit=limit)
         return SchemaIndexListResponse(
@@ -318,17 +359,11 @@ def create_app() -> FastAPI:
         response_model=IndexResponse,
         tags=["Schema Index"],
         summary="Bulk-index a Unity Catalog schema",
-        description=(
-            "Index all tables in a catalog.schema into the vector store. "
-            "Run this once after connecting a new Databricks workspace, "
-            "then agents auto-index newly encountered tables incrementally."
-        ),
     )
     async def index_schema(
         request: IndexRequest,
         api_key: str | None = Depends(get_api_key),
     ) -> IndexResponse:
-        """Trigger bulk indexing of a Unity Catalog schema."""
         from agents.tools.indexing_tools import bulk_index_schema
         result = bulk_index_schema(
             catalog=request.catalog,
@@ -347,11 +382,26 @@ def create_app() -> FastAPI:
         force_refresh: bool = False,
         api_key: str | None = Depends(get_api_key),
     ) -> dict[str, Any]:
-        """Index a specific table by its fully-qualified ID (catalog.schema.table)."""
         from agents.tools.indexing_tools import index_table_if_new, refresh_table_index
         if force_refresh:
             return refresh_table_index(table_id)
         return index_table_if_new(table_id)
+
+    # ---- Cache management ---------------------------------------------
+
+    @app.delete(
+        "/api/v1/cache",
+        tags=["Cache"],
+        summary="Flush semantic query result cache",
+    )
+    async def flush_cache(
+        database_name: str | None = None,
+        api_key: str | None = Depends(get_api_key),
+    ) -> dict[str, Any]:
+        """Invalidate L1 (Redis) and L2 (ChromaDB) cache entries."""
+        from core.semantic_cache import clear_cache
+        deleted = await clear_cache(database_name=database_name)
+        return {"status": "flushed", "l1_keys_deleted": deleted, "database": database_name}
 
     # ---- Few-shot examples --------------------------------------------
 
@@ -382,8 +432,12 @@ def create_app() -> FastAPI:
 
     # ---- Metrics -------------------------------------------------------
 
-    @app.get("/api/v1/metrics", tags=["System"], summary="Agent and index metrics")
+    @app.get("/api/v1/metrics", tags=["System"], summary="Telemetry + cache + feedback metrics")
     async def metrics(api_key: str | None = Depends(get_api_key)) -> dict[str, Any]:
+        from core.telemetry import get_metrics_snapshot
+        from core.semantic_cache import get_cache_stats
+        from agents.tools.feedback_tools import get_feedback_stats
+
         index_count = 0
         try:
             from core.schema_index import get_schema_index
@@ -391,10 +445,27 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
+        telemetry = get_metrics_snapshot()
+
+        cache_stats = {}
+        try:
+            cache_stats = get_cache_stats()
+        except Exception:
+            pass
+
+        feedback_stats = {}
+        try:
+            feedback_stats = get_feedback_stats()
+        except Exception:
+            pass
+
         return {
             "service": "text2sql-prism",
             "version": "1.0.0",
             "schema_index_size": index_count,
+            "telemetry": telemetry,
+            "cache": cache_stats,
+            "feedback": feedback_stats,
             "agents": {
                 "schema_discovery": "ready",
                 "metadata_enrichment": "ready",
