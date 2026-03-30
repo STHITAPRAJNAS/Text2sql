@@ -46,13 +46,23 @@ app = typer.Typer(
 
 
 def _setup_env():
-    """Load environment variables from .env file."""
+    """Load environment variables from .env file and initialize OTel."""
     from pathlib import Path
     env_file = Path(".env")
     if env_file.exists():
         from dotenv import load_dotenv
         load_dotenv(env_file)
         logger.info("Environment loaded from .env")
+
+    # Initialize OTel tracing + structlog correlation
+    from config.settings import get_settings
+    from core.telemetry import init_telemetry
+    s = get_settings()
+    init_telemetry(
+        service_name="text2sql-prism",
+        otlp_endpoint=s.observability.otel_exporter_otlp_endpoint,
+        enabled=s.observability.enable_tracing,
+    )
 
 
 @app.command()

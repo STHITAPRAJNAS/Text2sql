@@ -31,7 +31,12 @@ from typing import Any, AsyncGenerator
 import structlog
 
 from config.settings import get_settings
-from core.telemetry import trace_phase, record_query
+from core.telemetry import (
+    trace_phase, record_query, record_query_complete,
+    PRISM_QUERY, PRISM_DATABASE, PRISM_CONFIDENCE,
+    PRISM_ATTEMPT, PRISM_TENANT, USER_ID,
+    GENAI_REQUEST_MODEL, GENAI_SYSTEM,
+)
 
 try:
     from google.genai import types as genai_types
@@ -349,7 +354,13 @@ async def run_prism_query(
                 )
                 logger.info("Auto-retry", attempt=attempt, error=last_error[:80])
 
-            with trace_phase("total", {"query": query[:80], "database": database_name, "attempt": attempt}):
+            with trace_phase("total", {
+                PRISM_QUERY:    query[:100],
+                PRISM_DATABASE: database_name,
+                PRISM_ATTEMPT:  attempt,
+                PRISM_TENANT:   tenant_id,
+                USER_ID:        user_id,
+            }):
                 response_text, tok_in, tok_out = await _run_pipeline_with_tokens(
                     message, session_id, user_id
                 )
@@ -399,7 +410,6 @@ async def run_prism_query(
                 pass
     else:
         record_query("failed")
-        # Write to dead letter queue for human review
         if not result.get("needs_clarification"):
             from core.audit_log import log_dead_letter
             log_dead_letter(
@@ -410,6 +420,16 @@ async def run_prism_query(
                 database_name=database_name,
                 confidence=result.get("confidence", 0.0),
             )
+
+    # OTel histogram + token counters (semantic conventions)
+    record_query_complete(
+        pipeline_ms=result.get("pipeline_time_ms", 0.0),
+        database=database_name,
+        cache_hit=result.get("cache_hit", False),
+        pii_detected=bool(result.get("pii_report", {}) and result["pii_report"].get("pii_detected")),
+        token_input=result.get("token_input", 0) or 0,
+        token_output=result.get("token_output", 0) or 0,
+    )
 
     # Fire-and-forget audit write
     _fire_audit(result, session_id, user_id, query, database_name,

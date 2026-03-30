@@ -72,6 +72,46 @@ logger = structlog.get_logger(__name__)
 AGENTS_DIR = pathlib.Path(__file__).parent.parent / "agents"
 
 
+def _init_otel(app: FastAPI) -> None:
+    """
+    4. FastAPI auto-instrumentation via FastAPIInstrumentor.
+    Adds http.method, http.route, http.status_code, http.duration spans
+    for every request automatically.
+    """
+    settings = get_settings()
+    try:
+        from core.telemetry import init_telemetry
+        init_telemetry(
+            service_name="text2sql-prism",
+            otlp_endpoint=settings.observability.otel_exporter_otlp_endpoint,
+            enabled=settings.observability.enable_tracing,
+        )
+        if settings.observability.enable_tracing:
+            from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+            FastAPIInstrumentor.instrument_app(
+                app,
+                excluded_urls="health,metrics,docs,openapi.json",
+                server_request_hook=_otel_server_request_hook,
+            )
+            logger.info("FastAPI OTel auto-instrumentation enabled")
+    except ImportError:
+        logger.debug("opentelemetry-instrumentation-fastapi not installed — skipping auto-instrumentation")
+    except Exception as exc:
+        logger.warning("OTel FastAPI instrumentation failed", error=str(exc))
+
+
+def _otel_server_request_hook(span, scope: dict) -> None:
+    """Add correlation ID and user ID to every auto-instrumented HTTP span."""
+    if span and span.is_recording():
+        headers = dict(scope.get("headers", []))
+        correlation_id = headers.get(b"x-request-id", b"").decode()
+        user_id = headers.get(b"x-user-id", b"").decode()
+        if correlation_id:
+            span.set_attribute("http.request_id", correlation_id)
+        if user_id:
+            span.set_attribute("user.id", user_id)
+
+
 def _build_adk_app() -> FastAPI:
     """
     Create the base FastAPI app using Google ADK's get_fast_api_app().
@@ -134,6 +174,11 @@ def create_app() -> FastAPI:
     app = _build_adk_app()
 
     # ------------------------------------------------------------------ #
+    # 4. OTel FastAPI auto-instrumentation (must be before middleware)     #
+    # ------------------------------------------------------------------ #
+    _init_otel(app)
+
+    # ------------------------------------------------------------------ #
     # Middleware                                                           #
     # ------------------------------------------------------------------ #
     app.add_middleware(
@@ -147,13 +192,40 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def add_timing_and_correlation(request: Request, call_next):
-        # Propagate or generate correlation ID
+        # 2. W3C TraceContext propagation: extract from incoming headers
+        # so downstream spans are children of the caller's trace.
+        try:
+            from core.telemetry import extract_trace_context, get_current_trace_ids
+            from opentelemetry import context as otel_context
+            ctx = extract_trace_context(dict(request.headers))
+            token = otel_context.attach(ctx) if ctx else None
+        except Exception:
+            token = None
+
         correlation_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
         start = time.monotonic()
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        finally:
+            if token is not None:
+                try:
+                    otel_context.detach(token)
+                except Exception:
+                    pass
+
         elapsed_ms = round((time.monotonic() - start) * 1000, 2)
         response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
         response.headers["X-Request-ID"] = correlation_id
+
+        # Inject trace IDs into response headers for client-side correlation
+        try:
+            from core.telemetry import get_current_trace_ids
+            trace_ids = get_current_trace_ids()
+            if trace_ids.get("trace_id"):
+                response.headers["X-Trace-ID"] = trace_ids["trace_id"]
+                response.headers["X-Span-ID"] = trace_ids.get("span_id", "")
+        except Exception:
+            pass
         return response
 
     @app.middleware("http")
