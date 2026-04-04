@@ -1071,6 +1071,19 @@ def create_app() -> FastAPI:
             },
         }
 
+    # ------------------------------------------------------------------ #
+    # MCP client lifecycle                                                 #
+    # ------------------------------------------------------------------ #
+    @app.on_event("startup")
+    async def _start_mcp():
+        from core.mcp_client import init_mcp_client
+        init_mcp_client()   # no-op when MCP_ENABLED=false
+
+    @app.on_event("shutdown")
+    async def _stop_mcp():
+        from core.mcp_client import shutdown_mcp_client
+        shutdown_mcp_client()
+
     return app
 
 

@@ -64,6 +64,10 @@ def _setup_env():
         enabled=s.observability.enable_tracing,
     )
 
+    # Initialize MCP client (no-op when MCP_ENABLED=false)
+    from core.mcp_client import init_mcp_client
+    init_mcp_client()
+
 
 @app.command()
 def serve(

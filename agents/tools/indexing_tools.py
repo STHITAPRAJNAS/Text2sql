@@ -201,14 +201,44 @@ def index_table_if_new(
 
 def _fetch_table_metadata(table_id: str) -> dict[str, Any]:
     """
-    Fetch table metadata from Databricks (native) or SQLAlchemy (fallback).
-    Normalises the result into a standard dict format.
+    Fetch table metadata using the best available source.
+
+    Priority:
+      1. Databricks MCP server (if MCP_ENABLED=true and client is connected)
+      2. Databricks native SDK (if DATABRICKS_HOST is configured)
+      3. SQLAlchemy (fallback for non-Databricks databases)
     """
+    # ── 1. Try MCP first ──────────────────────────────────────────────
+    try:
+        from core.mcp_client import get_mcp_client
+        mcp_client = get_mcp_client()
+        if mcp_client is not None and mcp_client.has_tool("get_table"):
+            from agents.tools.mcp_tools import mcp_get_table_metadata
+            result = mcp_get_table_metadata(table_id)
+            if result.get("success") and result.get("columns") is not None:
+                # Normalise to standard metadata shape
+                metadata = {
+                    "full_name": table_id,
+                    "catalog": result.get("catalog", ""),
+                    "schema": result.get("schema", ""),
+                    "table": result.get("table", table_id.split(".")[-1]),
+                    "columns": result.get("columns", []),
+                    "comment": result.get("comment", ""),
+                    "row_count": result.get("row_count", -1),
+                    "table_type": result.get("table_type", "TABLE"),
+                    "source": "mcp",
+                }
+                return metadata
+            elif not result.get("success"):
+                logger.debug("MCP get_table failed, trying native SDK", error=result.get("error"))
+    except Exception as exc:
+        logger.debug("MCP metadata fetch error", table_id=table_id, error=str(exc))
+
+    # ── 2. Native Databricks SDK ───────────────────────────────────────
     from core.databricks import get_databricks_connector, UCTableRef
 
     db_connector = get_databricks_connector()
     if db_connector is not None:
-        # Use native Databricks SDK / SQL connector
         try:
             ref = UCTableRef.parse(table_id)
             metadata = db_connector.get_table_metadata(ref)
@@ -218,11 +248,12 @@ def _fetch_table_metadata(table_id: str) -> dict[str, Any]:
             metadata["partitioning"] = stats.get("partitioning", [])
             metadata["clustering_columns"] = stats.get("clustering_columns", [])
             metadata["full_name"] = table_id
+            metadata["source"] = "databricks_sdk"
             return metadata
         except Exception as e:
             return {"error": f"Databricks fetch failed for {table_id}: {e}"}
 
-    # SQLAlchemy fallback (non-Databricks databases)
+    # ── 3. SQLAlchemy fallback ─────────────────────────────────────────
     try:
         import asyncio
         from core.schema_manager import SchemaManager
@@ -239,6 +270,7 @@ def _fetch_table_metadata(table_id: str) -> dict[str, Any]:
                 return {"error": f"Table '{table_name}' not found in schema"}
             result = table.to_dict()
             result["full_name"] = table_id
+            result["source"] = "sqlalchemy"
             return result
 
         loop = asyncio.new_event_loop()

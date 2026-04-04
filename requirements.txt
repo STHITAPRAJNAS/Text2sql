@@ -37,6 +37,9 @@ opentelemetry-sdk>=1.28.0
 opentelemetry-instrumentation-fastapi>=0.49b0
 structlog>=24.4.0
 
+# ── MCP (Model Context Protocol) client ───────────────────────────────────────
+mcp>=1.0.0                # MCP client for Databricks MCP server integration
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.1
 tenacity>=9.0.0

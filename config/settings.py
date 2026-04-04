@@ -296,6 +296,69 @@ class ObservabilitySettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
+class MCPSettings(BaseSettings):
+    """
+    MCP (Model Context Protocol) client — connects to an external MCP server
+    (e.g. the official Databricks MCP server) and exposes its tools to PRISM
+    agents alongside the native Databricks connector.
+
+    Transports:
+      stdio — launch a local subprocess (MCP_SERVER_COMMAND)
+      sse   — connect to a running HTTP/SSE endpoint (MCP_SERVER_URL)
+
+    Quick start (Databricks official MCP server):
+      MCP_ENABLED=true
+      MCP_TRANSPORT=stdio
+      MCP_SERVER_COMMAND=databricks mcp start
+    """
+
+    enabled: bool = Field(default=False, description="Enable MCP client")
+    transport: str = Field(
+        default="stdio",
+        description="Transport: stdio (subprocess) or sse (HTTP endpoint)",
+    )
+    server_command: str = Field(
+        default="",
+        description="Command to launch MCP server subprocess (stdio transport). "
+                    "Example: 'databricks mcp start'",
+    )
+    server_url: str = Field(
+        default="",
+        description="SSE endpoint URL (sse transport). "
+                    "Example: 'http://localhost:3001/sse'",
+    )
+    discovery_timeout: int = Field(
+        default=10,
+        description="Seconds to wait for initial tool discovery at startup",
+    )
+    call_timeout: int = Field(
+        default=30,
+        description="Seconds to wait per tool call",
+    )
+
+    # Tool name overrides — set if your MCP server uses non-standard names
+    tool_execute_query: str = Field(default="execute_statement")
+    tool_list_catalogs: str = Field(default="list_catalogs")
+    tool_list_schemas: str = Field(default="list_schemas")
+    tool_list_tables: str = Field(default="list_tables")
+    tool_get_table: str = Field(default="get_table")
+    tool_search_tables: str = Field(default="search_tables")
+
+    @property
+    def is_configured(self) -> bool:
+        if not self.enabled:
+            return False
+        if self.transport == "stdio":
+            return bool(self.server_command)
+        return bool(self.server_url)
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="MCP_",
+        extra="ignore",
+    )
+
+
 class Settings(BaseSettings):
     """
     Master settings. All sections are composed here.
@@ -329,6 +392,7 @@ class Settings(BaseSettings):
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     allowlist: AllowlistSettings = Field(default_factory=AllowlistSettings)
     tenant: TenantSettings = Field(default_factory=TenantSettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
 
     model_config = SettingsConfigDict(
         env_file=".env",

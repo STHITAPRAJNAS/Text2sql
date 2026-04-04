@@ -35,6 +35,15 @@ from agents.tools.indexing_tools import (
     bulk_index_schema,
     refresh_table_index,
 )
+from agents.tools.mcp_tools import (
+    mcp_execute_query,
+    mcp_list_catalogs,
+    mcp_list_schemas,
+    mcp_list_tables,
+    mcp_get_table_metadata,
+    mcp_search_tables,
+    mcp_discover_tools,
+)
 
 
 def _make_check_schema_change_tool():
@@ -112,8 +121,47 @@ def create_schema_discovery_agent() -> Agent:
       7. get_sample_values         → understand filter column values
       8. search_schema_by_keyword  → keyword fallback search
       9. bulk_index_schema         → bootstrap a new catalog/schema
+
+    When MCP is enabled (MCP_ENABLED=true), the following MCP tools are also
+    registered and take priority for Databricks operations:
+      mcp_execute_query            → execute SQL via MCP server
+      mcp_get_table_metadata       → column metadata via MCP server
+      mcp_list_catalogs/schemas/tables → Unity Catalog navigation via MCP
+      mcp_search_tables            → full-text table search via MCP
+      mcp_discover_tools           → introspect available MCP tools
     """
     settings = get_settings()
+
+    # Core tool list (always present)
+    tools = [
+        # Vector index tools (primary for large databases)
+        search_relevant_tables,
+        index_table_if_new,
+        check_table_for_changes,
+        get_indexed_table,
+        list_indexed_tables,
+        bulk_index_schema,
+        refresh_table_index,
+        # Direct DB tools (fallback / supplementary)
+        get_database_schema,
+        get_table_details,
+        find_related_tables,
+        get_sample_values,
+        search_schema_by_keyword,
+    ]
+
+    # Prepend MCP tools when MCP is configured
+    if settings.mcp.is_configured:
+        mcp_tools = [
+            mcp_discover_tools,       # Introspect first — agents can plan tool use
+            mcp_list_catalogs,
+            mcp_list_schemas,
+            mcp_list_tables,
+            mcp_get_table_metadata,
+            mcp_search_tables,
+            mcp_execute_query,        # Also available for quick validation queries
+        ]
+        tools = mcp_tools + tools
 
     return Agent(
         name="schema_discovery_agent",
@@ -122,25 +170,12 @@ def create_schema_discovery_agent() -> Agent:
             "Database schema expert. For large databases (Unity Catalog), uses semantic "
             "vector search to find relevant tables among thousands, auto-indexes newly "
             "encountered tables, detects schema changes via Delta DESCRIBE HISTORY, "
-            "and builds focused schema context for SQL generation."
+            "and builds focused schema context for SQL generation. "
+            + ("MCP server connected — can navigate Unity Catalog natively via MCP tools. "
+               if settings.mcp.is_configured else "")
         ),
         instruction=PromptLibrary.SCHEMA_DISCOVERY_AGENT,
-        tools=[
-            # Vector index tools (primary for large databases)
-            search_relevant_tables,
-            index_table_if_new,
-            check_table_for_changes,
-            get_indexed_table,
-            list_indexed_tables,
-            bulk_index_schema,
-            refresh_table_index,
-            # Direct DB tools (fallback / supplementary)
-            get_database_schema,
-            get_table_details,
-            find_related_tables,
-            get_sample_values,
-            search_schema_by_keyword,
-        ],
+        tools=tools,
     )
 
 
