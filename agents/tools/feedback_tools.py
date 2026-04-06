@@ -40,6 +40,10 @@ def record_feedback(
     session_id: str | None = None,
     comment: str | None = None,
     corrected_sql: str | None = None,
+    predicted_confidence: float = 0.0,
+    skill_tags: list[str] | None = None,
+    user_id: str = "anonymous",
+    tenant_id: str = "default",
 ) -> dict[str, Any]:
     """
     Record user feedback on a generated SQL query.
@@ -62,6 +66,14 @@ def record_feedback(
     feedback_id = str(uuid.uuid4())
     actions_taken = []
 
+    # Auto-classify skills if not provided
+    if not skill_tags:
+        try:
+            from core.skill_classifier import classify_query
+            skill_tags = classify_query(query, sql)
+        except Exception:
+            skill_tags = []
+
     entry = {
         "feedback_id": feedback_id,
         "query": query,
@@ -71,19 +83,31 @@ def record_feedback(
         "session_id": session_id,
         "comment": comment,
         "corrected_sql": corrected_sql,
+        "skill_tags": skill_tags,
+        "user_id": user_id,
+        "tenant_id": tenant_id,
         "created_at": int(time.time()),
     }
 
     _feedback_store.append(entry)
-    # Keep last 1000 in memory
     if len(_feedback_store) > 1000:
         _feedback_store.pop(0)
 
-    # Active learning: high rating → add to few-shot store
+    # ── Skill 4: Confidence calibration ────────────────────────────────
+    # Record (predicted_confidence, actual_rating/5) for this skill type
+    if predicted_confidence > 0 and skill_tags:
+        try:
+            from core.confidence_calibrator import record_calibration
+            record_calibration(skill_tags, predicted_confidence, actual_rating=rating / 5.0)
+            actions_taken.append("calibration_recorded")
+        except Exception:
+            pass
+
+    # ── Active learning: high rating → add to few-shot + memory ────────
     if rating >= settings.feedback.min_rating_for_fewshot:
         sql_to_store = corrected_sql if corrected_sql else sql
         if settings.feedback.auto_add_to_fewshot:
-            success = _add_to_fewshot_store(query, sql_to_store, database_name, rating)
+            success = _add_to_fewshot_store(query, sql_to_store, database_name, rating, skill_tags)
             if success:
                 actions_taken.append("added_to_fewshot")
 
@@ -92,7 +116,7 @@ def record_feedback(
             if success:
                 actions_taken.append("added_to_memory")
 
-    # Negative feedback — log for human review
+    # ── Negative feedback ───────────────────────────────────────────────
     if rating <= 1.5:
         logger.warning(
             "Negative feedback received",
@@ -102,11 +126,27 @@ def record_feedback(
         )
         actions_taken.append("logged_for_review")
 
-    # If user provided a correction, store as high-value example
+    # ── Skill 2: Correction memory ──────────────────────────────────────
     if corrected_sql and corrected_sql != sql:
-        success = _add_to_fewshot_store(query, corrected_sql, database_name, 5.0)
+        # Store in few-shot store
+        success = _add_to_fewshot_store(query, corrected_sql, database_name, 5.0, skill_tags)
         if success and "added_to_fewshot" not in actions_taken:
             actions_taken.append("correction_added_to_fewshot")
+
+        # Store in correction store for negative-example learning
+        try:
+            from core.correction_store import store_correction
+            store_correction(
+                nl_query=query,
+                wrong_sql=sql,
+                correct_sql=corrected_sql,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                skill_tags=skill_tags,
+            )
+            actions_taken.append("correction_stored")
+        except Exception:
+            pass
 
     logger.info(
         "Feedback recorded",
@@ -127,15 +167,17 @@ def _add_to_fewshot_store(
     sql: str,
     database_name: str,
     rating: float,
+    skill_tags: list[str] | None = None,
 ) -> bool:
     """Add a query→SQL pair to the few-shot example store."""
     try:
-        from agents.tools.few_shot_tools import add_example
-        add_example(
+        from agents.tools.few_shot_tools import add_example_to_store  # fixed: was add_example
+        tags = ["feedback", f"rating_{int(rating)}"] + (skill_tags or [])
+        add_example_to_store(
             question=query,
             sql=sql,
             database_name=database_name,
-            tags=["feedback", f"rating_{int(rating)}"],
+            tags=tags,
             feedback_score=rating / 5.0,
         )
         logger.info("Example added to few-shot store", query=query[:50], rating=rating)

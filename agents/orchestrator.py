@@ -34,6 +34,7 @@ After-agent callback:
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from google.adk.agents import Agent, LlmAgent, ParallelAgent, SequentialAgent, LoopAgent
@@ -56,19 +57,22 @@ from agents.swarm.response_formatter import create_response_formatter_agent
 
 async def _add_session_to_memory_callback(callback_context: Any) -> None:
     """
-    After-agent callback: persist the completed session to the ADK MemoryService.
+    After-agent callback: persist the completed session to the ADK MemoryService,
+    then record progressive learning signals from ADK session state.
 
-    This enables self-improvement — the LoadMemoryTool in the SQL Generator
-    retrieves semantically similar past sessions as dynamic few-shot context,
-    growing richer with every production query.
+    ADK session state keys written by learning tools during the pipeline:
+      skill_tags            — set by classify_query_skills (Phase I)
+      join_paths_used       — set by classify_query_skills after SQL generation
+      predicted_confidence  — set by Deep Think query analyzer (Phase R)
 
-    Called automatically by ADK after the root orchestrator finishes each turn.
+    Learning signals recorded here (all fire-and-forget, zero latency):
+      schema_expertise   — join path success/failure per skill type
+      confidence_calibrator — predicted vs actual confidence per skill
     """
+    # ── Primary: persist session to ADK MemoryService ──────────────────
     try:
-        # Preferred ADK pattern: callback_context.add_session_to_memory()
         await callback_context.add_session_to_memory()
     except AttributeError:
-        # Fallback for older ADK versions or non-ADK test contexts
         try:
             from core.memory_store import add_session_to_memory
             session = getattr(callback_context, "session", None)
@@ -77,7 +81,62 @@ async def _add_session_to_memory_callback(callback_context: Any) -> None:
         except Exception:
             pass
     except Exception:
-        # Never let memory persistence errors fail the primary response
+        pass
+
+    # ── Secondary: record progressive learning signals ─────────────────
+    try:
+        state = getattr(callback_context, "state", None) or {}
+        skill_tags: list[str] = state.get("skill_tags", [])
+        join_paths: list[str] = state.get("join_paths_used", [])
+        predicted_conf: float = float(state.get("predicted_confidence", 0.0))
+
+        if skill_tags:
+            # Record join path expertise (with placeholder rating — real rating
+            # comes from feedback, here we use confidence as a proxy)
+            if join_paths:
+                from core.schema_expertise import record_join_result
+                # Fire-and-forget — use predicted_confidence as proxy rating (scale 0→5)
+                asyncio.create_task(
+                    _record_join_result_async(join_paths, skill_tags, predicted_conf * 5.0)
+                )
+
+            # Record confidence calibration (actual rating will be updated via
+            # feedback endpoint; here we seed with the predicted value)
+            if predicted_conf > 0:
+                from core.confidence_calibrator import record_calibration
+                # actual_rating unknown yet — seeded as None-equivalent (0)
+                # The real calibration update happens in record_feedback()
+                # This just records that a prediction was made at this confidence level
+                asyncio.create_task(
+                    _record_calibration_async(skill_tags, predicted_conf)
+                )
+    except Exception:
+        pass  # Learning signals must never affect primary response
+
+
+async def _record_join_result_async(
+    join_paths: list[str],
+    skill_tags: list[str],
+    rating_proxy: float,
+) -> None:
+    """Async wrapper for fire-and-forget join expertise recording."""
+    try:
+        from core.schema_expertise import record_join_result
+        record_join_result(join_paths, skill_tags, rating_proxy)
+    except Exception:
+        pass
+
+
+async def _record_calibration_async(
+    skill_tags: list[str],
+    predicted_conf: float,
+) -> None:
+    """Async wrapper for fire-and-forget calibration recording."""
+    try:
+        from core.confidence_calibrator import record_calibration
+        # 0.0 actual means "pending feedback" — feedback endpoint updates real value
+        record_calibration(skill_tags, predicted_conf, actual_rating=0.0)
+    except Exception:
         pass
 
 

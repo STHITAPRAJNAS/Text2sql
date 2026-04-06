@@ -20,6 +20,13 @@ from agents.tools.schema_tools import (
 from agents.tools.few_shot_tools import get_similar_examples
 from agents.tools.memory_tools import store_successful_query, get_memory_context
 from agents.tools.indexing_tools import search_relevant_tables
+from agents.tools.learning_tools import (
+    classify_query_skills,
+    find_correction_examples,
+    get_proven_join_paths,
+    get_effective_confidence_threshold,
+    find_known_clarification,
+)
 
 
 def create_sql_generator_agent() -> Agent:
@@ -51,13 +58,27 @@ def create_sql_generator_agent() -> Agent:
 
     # Core tools
     tools = [
+        # ── Progressive learning tools (consult before generating SQL) ──
+        # 1. Classify skills → writes to session state for other tools
+        classify_query_skills,
+        # 2. Retrieve past corrections (avoid known mistakes)
+        find_correction_examples,
+        # 3. Retrieve proven join paths for current skill type
+        get_proven_join_paths,
+        # 4. Check if a clarification is already known (skip asking user)
+        find_known_clarification,
+        # 5. Get calibrated confidence threshold for this skill type
+        get_effective_confidence_threshold,
+        # ── Few-shot & memory retrieval ─────────────────────────────────
         get_similar_examples,
         get_memory_context,
+        # ── Schema context tools ────────────────────────────────────────
         search_relevant_tables,
         get_table_details,
         find_related_tables,
         get_sample_values,
         search_schema_by_keyword,
+        # ── Post-generation storage ─────────────────────────────────────
         store_successful_query,
     ]
 
